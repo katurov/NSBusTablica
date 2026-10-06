@@ -106,7 +106,7 @@ curl -sS 'http://gspns.rs/red-voznje/ispis-polazaka?rv=rvg&vaziod=2026-10-01&dan
 2. Firmware already uploaded (`pio run -t upload` in `firmware/`).
 3. Bridge: `pip install -r requirements.txt` → `python3 oled_bridge.py --stop 6539`
 4. **Don't open** the same serial port in `pio device monitor` / another process while bridge holds it — will get «veza izgubljena» / port failure.
-5. Brightness: `OLED_CONTRAST` in `firmware/platformio.ini` (currently 80 out of 255).
+5. Brightness: `OLED_CONTRAST` in `firmware/platformio.ini` (currently 40 out of 255).
 
 ## 7. Agent Success Checklist
 
