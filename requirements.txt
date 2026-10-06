@@ -1,0 +1,5 @@
+# NStupido — Python dependencies
+#
+# Core (nstupido.py, timetable.py, rs_holidays.py): stdlib only — nothing to install.
+# OLED USB bridge (oled_bridge.py) needs pyserial:
+pyserial>=3.5

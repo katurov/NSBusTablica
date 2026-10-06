@@ -1,0 +1,29 @@
+# Runtime state (created on first run)
+state.json
+stations_cache.json
+cache/
+snapshots*.jsonl
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Firmware / PlatformIO / editor
+firmware/.pio/
+firmware/.vscode/
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS / local overlays
+.DS_Store
+.AppleDouble
+local*.ini
+*.local
