@@ -1,153 +1,153 @@
 # NStupido
 
-Домашнее табло ближайших автобусов ГСП Нови-Сад: живые данные nsmart + память между снимками + официальное расписание gspns.rs → компактный JSON, HTTP API и OLED 128×64 по USB.
+Home display for upcoming buses in GSP Novi Sad: live nsmart data + memory between snapshots + official gspns.rs schedule → compact JSON, HTTP API, and USB-connected OLED 128×64.
 
-## Назначение
+## Purpose
 
-Скрипт опрашивает недокументированный эндпоинт nsmart для одной или нескольких остановок, запоминает увиденные автобусы (чтобы пустые снимки не «обнуляли» табло), подмешивает ETA с предыдущих остановок маршрута и добавляет рейсы «по расписанию» из gspns.rs. Результат:
+The script polls the undocumented nsmart endpoint for one or more stops, remembers buses seen (so empty snapshots don't "reset" the display), blends in ETAs from previous stops on the route, and adds "scheduled" departures from gspns.rs. Output:
 
-- CLI → JSON в stdout;
-- HTTP-сервер (`--serve`) → `GET /buses`, `GET /debug`;
-- прошивка ESP32 + `oled_bridge.py` → строки вида `4(G)` / `12(E)` / `8(P)` на OLED.
+- CLI → JSON to stdout;
+- HTTP server (`--serve`) → `GET /buses`, `GET /debug`;
+- ESP32 firmware + `oled_bridge.py` → strings like `4(G)` / `12(E)` / `8(P)` on OLED.
 
-Ключей и авторизации нет. Только стандартная библиотека Python 3 для сервера; для USB-моста нужен `pyserial` (см. `requirements.txt`).
+No keys or authentication required. Python 3 standard library only for server; USB bridge requires `pyserial` (see `requirements.txt`).
 
-## Состав проекта
+## Project Structure
 
-| путь | роль |
+| Path | Role |
 |---|---|
-| `nstupido.py` | ядро: fetch nsmart, память, фидеры, merge с расписанием, CLI и HTTP-сервер |
-| `timetable.py` | загрузка/кэш gspns.rs, тип дня, `STOP_LINES`, выдача scheduled-рейсов |
-| `rs_holidays.py` | праздники Республики Сербия (в т.ч. православная Пасха) для fallback типа дня |
-| `oled_bridge.py` | читает `/buses` с локального сервера и шлёт кадры на ESP32 по serial |
+| `nstupido.py` | Core: fetch nsmart, memory, feeders, merge with schedule, CLI and HTTP server |
+| `timetable.py` | Load/cache gspns.rs, day type, `STOP_LINES`, output scheduled departures |
+| `rs_holidays.py` | Republic of Serbia holidays (incl. Orthodox Easter) for fallback day type |
+| `oled_bridge.py` | Reads `/buses` from local server and sends frames to ESP32 via serial |
 | `firmware/` | PlatformIO + `src/main.cpp` — OLED board (Wemos/LOLIN S2 mini) |
-| `tests/` | офлайн unit-тесты + live connectivity (`test_live_sources.py`) |
-| `tests/fixtures/` | HTML-снимки gspns для офлайн-парсеров |
-| `samples/` | примеры сырых ответов nsmart |
-| `HOW_TO_TEST_DATA.md` | playbook для агента: как проверить, что данные приходят |
-| `requirements.txt` | `pyserial` только для моста; ядро — stdlib |
-| `state.json` | **runtime**, не в git: память автобусов + выученное время в пути |
-| `cache/gspns/` | **runtime**: кэш расписаний и index (vaziod, тип дня) |
-| `stations_cache.json` | **runtime**: полные имена остановок из getAllStations |
+| `tests/` | Offline unit tests + live connectivity (`test_live_sources.py`) |
+| `tests/fixtures/` | gspns HTML snapshots for offline parsers |
+| `samples/` | Sample raw nsmart responses |
+| `HOW_TO_TEST_DATA.md` | Agent playbook: how to verify data is coming through |
+| `requirements.txt` | `pyserial` only for bridge; core uses stdlib |
+| `state.json` | **runtime**, not in git: bus memory + learned travel times |
+| `cache/gspns/` | **runtime**: schedule cache and index (vaziod, day type) |
+| `stations_cache.json` | **runtime**: full stop names from getAllStations |
 
-## Источники данных
+## Data Sources
 
-| источник | как | auth |
+| Source | How | Auth |
 |---|---|---|
-| **nsmart** live | `POST https://online.nsmart.rs/sr/najava-dolaska/` (`station_uid`, …) | нет |
-| **nsmart** имена | `POST …/AnnouncementForStation/getAllStations` | нет |
-| **gspns** тип дня / vaziod | `GET http://gspns.rs/red-voznje/gradski` | нет |
-| **gspns** отправления | `GET …/ispis-polazaka?rv=&vaziod=&dan=&linija[]=` | нет |
-| **праздники** | `rs_holidays.py` (закон РС) | — |
+| **nsmart** live | `POST https://online.nsmart.rs/sr/najava-dolaska/` (`station_uid`, …) | none |
+| **nsmart** names | `POST …/AnnouncementForStation/getAllStations` | none |
+| **gspns** day type / vaziod | `GET http://gspns.rs/red-voznje/gradski` | none |
+| **gspns** departures | `GET …/ispis-polazaka?rv=&vaziod=&dan=&linija[]=` | none |
+| **holidays** | `rs_holidays.py` (RS law) | — |
 
-Эндпоинты недокументированы и могут измениться без предупреждения.
+Endpoints are undocumented and may change without notice.
 
-## Статусы на табло
+## Display Status Types
 
-| `status` | `label` | OLED | смысл |
+| `status` | `label` | OLED | Meaning |
 |---|---|---|---|
-| `live` | Sveže | `G` | автобус в свежем снимке (своя остановка или предыдущая) |
-| `lost` | Videli-izgubili | `E` | видели раньше, сейчас оценка по памяти |
-| `scheduled` | Po rasporedu | `P` | рейс из расписания, ещё не видели |
+| `live` | Sveže | `G` | Bus in fresh snapshot (this stop or previous one) |
+| `lost` | Videli-izgubili | `E` | Seen earlier, now estimating from memory |
+| `scheduled` | Po rasporedu | `P` | Departure from schedule, not yet seen |
 
-## Остановки по умолчанию
+## Default Stops
 
-| uid | код | название | линии |
+| uid | Code | Name | Lines |
 |---|---|---|---|
 | 6539 | 0220B | Bulevar kralja Petra prvog-Mašinska škola | 18A, 3, 8 |
-| 15889 | 0509-1A | Bulevar Oslobodjenja … prigrad (пригородные) | 52–56, 60–64, 68, 69, 71–74, 76–81, 84, 86 (+IS) |
-| 6712 | 0509A | Bulevar Oslobođenja - Bulevar Kralja Petra prvog (городские) | 4, 7A, 10/10MAL, 14/14S/14GS, 15, 18A, 19, 3A, 5N |
+| 15889 | 0509-1A | Bulevar Oslobodjenja … prigrad (suburban) | 52–56, 60–64, 68, 69, 71–74, 76–81, 84, 86 (+IS) |
+| 6712 | 0509A | Bulevar Oslobođenja - Bulevar Kralja Petra prvog (city) | 4, 7A, 10/10MAL, 14/14S/14GS, 15, 18A, 19, 3A, 5N |
 
-15889 и 6712 ~3 м друг от друга, от 6539 ~385 м. Другие полезные: 6551 (напротив 6539), 6709 (другая сторона бульвара).
+15889 and 6712 are ~3 m apart, ~385 m from 6539. Other useful stops: 6551 (opposite 6539), 6709 (other side of boulevard).
 
-Для новой остановки: передать uid в CLI/`?stop=`; для своего расписания — дописать `STOP_LINES` в `timetable.py` и при желании `SEED_FEEDERS` / `DEFAULT_STOPS` в `nstupido.py`.
+For a new stop: pass uid in CLI/`?stop=`; for your own schedule — add `STOP_LINES` in `timetable.py` and optionally `SEED_FEEDERS` / `DEFAULT_STOPS` in `nstupido.py`.
 
-## Параметры
+## Parameters
 
-### CLI / сервер (`nstupido.py`)
+### CLI / server (`nstupido.py`)
 
-| флаг | по умолчанию | смысл |
+| Flag | Default | Meaning |
 |---|---|---|
-| `stops…` | 6539 15889 6712 | uid остановок |
-| `--merge` | off | один общий список автобусов, сортировка по времени |
-| `--serve` | off | HTTP-сервер + фоновый опрос |
-| `--port` | 8080 | порт сервера |
-| `--host` | `0.0.0.0` | bind-адрес |
-| `--interval` | 15 | период опроса, с |
-| `--state FILE` | `state.json` | файл памяти |
-| `--no-state` | — | не грузить/не писать память |
-| `--no-schedule` | — | без gspns |
-| `--schedule-only` | — | только расписание, без nsmart (отладка) |
-| `--no-feeders` | — | не опрашивать предыдущие остановки |
-| `--pretty` | — | indented JSON (CLI) |
-| `--log-snapshots FILE` | — | каждый снимок upstream → JSONL |
+| `stops…` | 6539 15889 6712 | Stop uids |
+| `--merge` | off | One combined bus list, sorted by time |
+| `--serve` | off | HTTP server + background polling |
+| `--port` | 8080 | Server port |
+| `--host` | `0.0.0.0` | Bind address |
+| `--interval` | 15 | Poll period, seconds |
+| `--state FILE` | `state.json` | Memory file |
+| `--no-state` | — | Don't load/save memory |
+| `--no-schedule` | — | Without gspns |
+| `--schedule-only` | — | Schedule only, no nsmart (debug) |
+| `--no-feeders` | — | Don't poll previous stops |
+| `--pretty` | — | Indented JSON (CLI) |
+| `--log-snapshots FILE` | — | Each upstream snapshot → JSONL |
 
-На сервере: `GET /buses[?stop=6539[,6551]][&merge=1][&schedule=0\|only]`, `GET /debug`.
+On server: `GET /buses[?stop=6539[,6551]][&merge=1][&schedule=0\|only]`, `GET /debug`.
 
-### USB-мост (`oled_bridge.py`)
+### USB bridge (`oled_bridge.py`)
 
-| флаг | по умолчанию | смысл |
+| Flag | Default | Meaning |
 |---|---|---|
-| `--stop` | 6539 | uid для табло |
-| `--port` | auto (`/dev/cu.usbmodem*` / `ttyACM*`) | serial |
-| `--server-port` | 8080 | локальный nstupido |
-| `--every` | 5 | период обновления кадра, с |
-| `--once` | — | один кадр и выход |
+| `--stop` | 6539 | Stop uid for display |
+| `--port` | auto (`/dev/cu.usbmodem*` / `ttyACM*`) | Serial port |
+| `--server-port` | 8080 | Local nstupido port |
+| `--every` | 5 | Frame refresh period, seconds |
+| `--once` | — | One frame and exit |
 
-### Прошивка (`firmware/platformio.ini` → `build_flags`)
+### Firmware (`firmware/platformio.ini` → `build_flags`)
 
-| define | по умолчанию | смысл |
+| Define | Default | Meaning |
 |---|---|---|
 | `OLED_SDA` | 18 | I2C SDA (LOLIN S2 mini) |
 | `OLED_SCL` | 16 | I2C SCL |
-| `OLED_CONTRAST` | 40 | яркость 0…255 (сток ~255 слишком яркий) |
-| `OLED_SH1106` | выкл. | раскомментировать для панели SH1106 1.3″ |
+| `OLED_CONTRAST` | 40 | Brightness 0…255 (stock ~255 too bright) |
+| `OLED_SH1106` | off | Uncomment for SH1106 1.3″ panel |
 
-## Быстрый старт
+## Quick Start
 
 ```bash
-# ядро — только Python 3
+# Core — Python 3 only
 python3 nstupido.py 6539 --pretty
 python3 nstupido.py --serve --port 8080
 
-# OLED-мост
+# OLED bridge
 pip install -r requirements.txt          # pyserial
-python3 nstupido.py --serve --port 8080  # если ещё не запущен
+python3 nstupido.py --serve --port 8080  # if not already running
 python3 oled_bridge.py --stop 6539
 
-# прошивка (нужен PlatformIO)
+# Firmware (PlatformIO required)
 cd firmware && pio run -t upload && cd ..
-# яркость: -DOLED_CONTRAST=40 в platformio.ini
+# Brightness: -DOLED_CONTRAST=40 in platformio.ini
 ```
 
-Не открывайте serial-монитор, пока мост держит порт.
+Don't open serial monitor while bridge holds the port.
 
-## Тесты
+## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v          # офлайн + live
-python3 -m unittest tests.test_schedule -v        # только офлайн
-python3 -m unittest tests.test_live_sources -v    # только upstream
+python3 -m unittest discover -s tests -v          # offline + live
+python3 -m unittest tests.test_schedule -v        # offline only
+python3 -m unittest tests.test_live_sources -v    # upstream only
 ```
 
-Офлайн: тип дня, полночь, смена расписания, matching, фидеры (`tests/fixtures/`).
-Live: доступность nsmart и gspns — см. **[HOW_TO_TEST_DATA.md](HOW_TO_TEST_DATA.md)** (чеклист для агента, curl, отличия «пустой nsmart» vs «API лежит»).
+Offline: day type, midnight, schedule change, matching, feeders (`tests/fixtures/`).
+Live: nsmart and gspns availability — see **[HOW_TO_TEST_DATA.md](HOW_TO_TEST_DATA.md)** (agent checklist, curl, differences between "empty nsmart" vs "API down").
 
-## Память (кратко)
+## Memory (Brief)
 
-Снимки nsmart обновляются ~15–20 с и часто почти пустые. NStupido запоминает каждый автобус по ключу (остановка, гараж, линия) и сам отсчитывает ETA, пока не придёт свежее значение. Удаление: 0 с уже 30 с без появления в снимке; не видели дольше `последнее значение + 120 с` (≤20 мин); тот же рейс уже после нашей остановки; новый рейс того же автобуса на линии. `state.json` рядом со скриптом; сервер копит память даже без клиентов.
+nsmart snapshots refresh ~15–20 s and are often nearly empty. NStupido remembers each bus by key (stop, garage, line) and counts down ETA itself until a fresh value arrives. Removal: 0 s already 30 s without appearing in snapshot; not seen longer than `last value + 120 s` (≤20 min); same trip already past our stop; new trip of same bus on line. `state.json` beside script; server accumulates memory even without clients.
 
-## Предыдущие остановки (фидеры)
+## Previous Stops (Feeders)
 
-Ответ самой остановки часто пуст, а предыдущая по маршруту показывает те же автобусы раньше. ETA = ETA до предыдущей + разница `second_left_by_route`. Помечены `"source":"via 6540"`. Сиды: 6539 ← 6540/6750/6679; 6712 ← 6586/6728; 15889 — нет (перед ней конечные с фейковыми `P1`…). Опрос через раз (~30 с). `--no-feeders` отключает.
+The stop itself often returns empty, while the previous one on the route shows the same buses earlier. ETA = ETA to previous + `second_left_by_route` difference. Marked `"source":"via 6540"`. Seeds: 6539 ← 6540/6750/6679; 6712 ← 6586/6728; 15889 — none (terminals before it with fake `P1`…). Polled every other cycle (~30 s). `--no-feeders` disables.
 
-## Расписание (кратко)
+## Schedule (Brief)
 
-Раз в сутки (и при старте) читается тип дня на gspns + `vaziod`, качаются R/S/N/P для линий из `STOP_LINES` → `cache/gspns/`. Fallback типа дня: праздник → P, сб → S, вс → N, иначе R. Рейсы после полуночи относятся к предыдущему сервисному дню. В окне ~40 мин до ETA; через 3 мин после due без автобуса — пропадают. Сопоставление с live по `entered_departure_time` ±1 мин или ближайший ±6 мин. `--no-schedule` / `--schedule-only`; на сервере `?schedule=0` / `?schedule=only`.
+Once daily (and at startup) the day type is read from gspns + `vaziod`, R/S/N/P for lines from `STOP_LINES` are downloaded → `cache/gspns/`. Day type fallback: holiday → P, Sat → S, Sun → N, otherwise R. Trips after midnight belong to previous service day. Window ~40 min before ETA; 3 min after due without bus — removed. Matching with live by `entered_departure_time` ±1 min or nearest ±6 min. `--no-schedule` / `--schedule-only`; on server `?schedule=0` / `?schedule=only`.
 
-## Формат JSON
+## JSON Format
 
-По остановкам (по умолчанию):
+Per-stop (default):
 
 ```json
 {"timestamp":"…","stops":[
@@ -160,26 +160,26 @@ Live: доступность nsmart и gspns — см. **[HOW_TO_TEST_DATA.md](H
 ]}
 ```
 
-`--merge` / `?merge=1`: один `buses[]` с `stop_uid` / `stop_name`; ошибки остановок — в `errors`.
+`--merge` / `?merge=1`: one `buses[]` with `stop_uid` / `stop_name`; stop errors — in `errors`.
 
-| поле | значение |
+| Field | Value |
 |---|---|
-| `line` / `direction` | линия и конечная |
-| `minutes` / `seconds` | до прибытия |
-| `stops_between` | остановок до вас (`null` у scheduled) |
-| `garage_no`, `lat`, `lng`, `current_stop` | позиция (`null` у scheduled) |
+| `line` / `direction` | Line and destination |
+| `minutes` / `seconds` | Until arrival |
+| `stops_between` | Stops until you (`null` for scheduled) |
+| `garage_no`, `lat`, `lng`, `current_stop` | Position (`null` for scheduled) |
 | `status` / `label` / `live` | live / lost / scheduled |
-| `last_seen` | секунд с последнего снимка (`null` у scheduled) |
+| `last_seen` | Seconds since last snapshot (`null` for scheduled) |
 | `scheduled_departure` / `expected` | HH:MM |
-| `source` | `direct` или `via <uid>` |
-| `variant` / `trip_id` | вариант gspns и id рейса |
+| `source` | `direct` or `via <uid>` |
+| `variant` / `trip_id` | gspns variant and trip id |
 
-У остановки: `updated` — секунд с последнего успешного upstream. При сетевой ошибке есть `error`, но память всё равно отдаётся. Сортировка по `seconds`. Код выхода CLI 1, если все запросы с ошибкой и показать нечего. HTTP: 200 / 400 / 404 / 502.
+For stop: `updated` — seconds since last successful upstream. On network error there's `error`, but memory is still returned. Sorted by `seconds`. CLI exit code 1 if all requests errored and nothing to show. HTTP: 200 / 400 / 404 / 502.
 
-## Замечания
+## Notes
 
-- nsmart часто с коротким горизонтом → нужны память, фидеры и расписание.
-- Список линий для 6712/15889 частично предположительный; 56 не включена (по mreza здесь не проходит). Объявления на `gspns.rs/aktuelno` скрипт не читает.
-- `radius` на прогноз прибытия не влияет (только на поиск ближайших остановок).
-- Названия в ответе обрезаются до 50 символов — восстанавливаются из словаря / `stations_cache.json`.
-- Найти uid: `POST …/getAllStations` (поля `id`, `name`).
+- nsmart often has short horizon → memory, feeders, and schedule needed.
+- Line list for 6712/15889 partially presumed; 56 not included (per mreza doesn't pass here). Announcements on `gspns.rs/aktuelno` not read by script.
+- `radius` doesn't affect arrival prediction (only nearest stop search).
+- Names in response truncated to 50 characters — restored from dictionary / `stations_cache.json`.
+- Find uid: `POST …/getAllStations` (fields `id`, `name`).
