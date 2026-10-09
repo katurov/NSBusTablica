@@ -6,6 +6,10 @@
 //           = E:<min>  estimate after lose ("Videli-izgubili")
 //           = P:<min>  timetable ("Po rasporedu")
 //   E                    end of frame -> draw
+// Board -> host:
+//   OK                   frame drawn
+//   BTN                  BOOT button (GPIO0) pressed -> host switches to next stop
+// While waiting for the next stop's frame the header is shown inverted.
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8g2lib.h>
@@ -15,6 +19,12 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 #else
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 #endif
+
+#ifndef BTN_PIN
+#define BTN_PIN 0          // BOOT button on LOLIN S2 mini, active low
+#endif
+#define BTN_DEBOUNCE_MS 30
+#define BTN_FEEDBACK_MS 3000  // max time the "switching" header is shown
 
 #ifndef OLED_CONTRAST
 #define OLED_CONTRAST 40   // 0..255; stock ~255 is too bright for a desk board
@@ -30,6 +40,7 @@ static int nRows = 0, nPending = 0;
 static uint32_t lastFrame = 0;
 static bool haveFrame = false;
 static String buf;
+static uint32_t btnFeedbackSince = 0;   // 0 = no pending switch
 
 // Line number column width; remaining width is split equally among cells.
 static const int LINE_W = 28;
@@ -49,10 +60,14 @@ static void drawCell(int cellLeft, int cellW, int baseline, const Cell &c) {
 
 static void render() {
   oled.clearBuffer();
+  bool switching = btnFeedbackSince != 0;
+  if (switching) { oled.drawBox(0, 0, 128, 13); oled.setDrawColor(0); }
   oled.setFont(u8g2_font_7x13B_tr);
   oled.drawStr(0, 11, hdrStop);
   oled.setFont(u8g2_font_6x12_tr);
-  if (hdrTime[0]) oled.drawStr(128 - oled.getStrWidth(hdrTime), 10, hdrTime);
+  if (switching) oled.drawStr(128 - oled.getStrWidth(">>"), 10, ">>");
+  else if (hdrTime[0]) oled.drawStr(128 - oled.getStrWidth(hdrTime), 10, hdrTime);
+  oled.setDrawColor(1);
   oled.drawHLine(0, 13, 128);
 
   uint32_t age = haveFrame ? (millis() - lastFrame) : 0;
@@ -116,15 +131,17 @@ static void handleLine(String line) {
   } else if (type == 'E') {
     memcpy(rows, pending, sizeof rows); nRows = nPending;
     haveFrame = true; lastFrame = millis();
+    btnFeedbackSince = 0;
     render();
     Serial.println("OK");
   } else if (type == '?') {
-    Serial.println("NStupido OLED v2");
+    Serial.println("NStupido OLED v3");
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  pinMode(BTN_PIN, INPUT_PULLUP);
   Wire.begin(OLED_SDA, OLED_SCL);
   delay(300);
   for (uint8_t a = 1; a < 127; a++) {
@@ -134,10 +151,33 @@ void setup() {
   oled.setBusClock(400000);
   oled.begin();
   oled.setContrast(OLED_CONTRAST);
+  oled.setFontMode(1);   // transparent: lets the header text be drawn inverted
   render();
 }
 
+// Debounced press detection; returns true once per press (on the stable LOW edge).
+static bool buttonPressed() {
+  static bool stable = HIGH, lastRaw = HIGH;
+  static uint32_t changedAt = 0;
+  bool raw = digitalRead(BTN_PIN);
+  if (raw != lastRaw) { lastRaw = raw; changedAt = millis(); }
+  if (raw != stable && millis() - changedAt >= BTN_DEBOUNCE_MS) {
+    stable = raw;
+    return stable == LOW;
+  }
+  return false;
+}
+
 void loop() {
+  if (buttonPressed()) {
+    Serial.println("BTN");
+    btnFeedbackSince = millis() | 1;   // never 0
+    render();
+  }
+  if (btnFeedbackSince && millis() - btnFeedbackSince > BTN_FEEDBACK_MS) {
+    btnFeedbackSince = 0;              // host didn't answer: back to normal header
+    render();
+  }
   while (Serial.available()) {
     char ch = Serial.read();
     if (ch == '\n') { handleLine(buf); buf = ""; }

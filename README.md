@@ -19,7 +19,7 @@ No keys or authentication required. Python 3 standard library only for server; U
 | `nstupido.py` | Core: fetch nsmart, memory, feeders, merge with schedule, CLI and HTTP server |
 | `timetable.py` | Load/cache gspns.rs, day type, `STOP_LINES`, output scheduled departures |
 | `rs_holidays.py` | Republic of Serbia holidays (incl. Orthodox Easter) for fallback day type |
-| `oled_bridge.py` | Reads `/buses` from local server and sends frames to ESP32 via serial |
+| `oled_bridge.py` | Reads `/buses` from local server and sends frames to ESP32 via serial; BOOT button cycles stops |
 | `firmware/` | PlatformIO + `src/main.cpp` — OLED board (Wemos/LOLIN S2 mini) |
 | `tests/` | Offline unit tests + live connectivity (`test_live_sources.py`) |
 | `tests/fixtures/` | gspns HTML snapshots for offline parsers |
@@ -88,7 +88,8 @@ On server: `GET /buses[?stop=6539[,6551]][&merge=1][&schedule=0\|only]`, `GET /d
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--stop` | 6539 | Stop uid for display |
+| `--stop` | 6539 | Stop shown at start |
+| `--stops` | server's `default_stops` | Comma-separated stops the BOOT button cycles through |
 | `--port` | auto (`/dev/cu.usbmodem*` / `ttyACM*`) | Serial port |
 | `--server-port` | 8080 | Local nstupido port |
 | `--every` | 5 | Frame refresh period, seconds |
@@ -102,6 +103,19 @@ On server: `GET /buses[?stop=6539[,6551]][&merge=1][&schedule=0\|only]`, `GET /d
 | `OLED_SCL` | 16 | I2C SCL |
 | `OLED_CONTRAST` | 40 | Brightness 0…255 (stock ~255 too bright) |
 | `OLED_SH1106` | off | Uncomment for SH1106 1.3″ panel |
+| `BTN_PIN` | 0 | Stop-switch button (BOOT on LOLIN S2 mini, active low) |
+
+### BOOT button: cycle stops
+
+Pressing the board's **BOOT** button (GPIO0) switches the display to the next stop, wrapping around — handy for demos.
+
+1. Firmware debounces GPIO0 (30 ms, `INPUT_PULLUP`), sends `BTN` over USB serial and immediately shows the header inverted with `>>` (instant feedback; reverts after 3 s if the host doesn't answer).
+2. `oled_bridge.py` reads the serial input non-blocking between refreshes, advances to the next stop and pushes that stop's frame right away (no wait for the 5 s cycle).
+3. The header shows the current stop and position, e.g. `15889 2/3`.
+
+Stop list: `--stops` if given, else `default_stops` from the server (`GET /` → 6539, 15889, 6712); the bridge always starts at `--stop` (6539). Any stop works since the server answers `/buses?stop=<uid>`. The choice isn't persisted: restarting the bridge returns to `--stop`.
+
+Serial protocol, board → host: `OK` (frame drawn), `BTN` (button), `I2C device at 0x..` (boot scan); unknown lines are ignored. `?` returns the firmware version (`NStupido OLED v3`).
 
 ## Quick Start
 
@@ -113,7 +127,10 @@ python3 nstupido.py --serve --port 8080
 # OLED bridge
 pip install -r requirements.txt          # pyserial
 python3 nstupido.py --serve --port 8080  # if not already running
-python3 oled_bridge.py --stop 6539
+python3 oled_bridge.py --stop 6539      # BOOT button cycles 6539 → 15889 → 6712
+
+# Bridge as a background daemon that survives closing the terminal
+nohup python3 oled_bridge.py --stop 6539 >> oled_bridge.log 2>&1 &
 
 # Firmware (PlatformIO required)
 cd firmware && pio run -t upload && cd ..
@@ -128,6 +145,7 @@ Don't open serial monitor while bridge holds the port.
 python3 -m unittest discover -s tests -v          # offline + live
 python3 -m unittest tests.test_schedule -v        # offline only
 python3 -m unittest tests.test_live_sources -v    # upstream only
+python3 -m unittest tests.test_bridge -v          # bridge: stop cycling, serial input
 ```
 
 Offline: day type, midnight, schedule change, matching, feeders (`tests/fixtures/`).
