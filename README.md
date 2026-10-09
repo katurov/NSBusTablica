@@ -92,7 +92,7 @@ On server: `GET /buses[?stop=6539[,6551]][&merge=1][&schedule=0\|only]`, `GET /d
 | `--stops` | server's `default_stops` | Comma-separated stops the BOOT button cycles through |
 | `--port` | auto (`/dev/cu.usbmodem*` / `ttyACM*`) | Serial port |
 | `--server-port` | 8080 | Local nstupido port |
-| `--every` | 5 | Frame refresh period, seconds |
+| `--every` | 5 | Frame refresh period (and page rotation), seconds |
 | `--once` | — | One frame and exit |
 
 ### Firmware (`firmware/platformio.ini` → `build_flags`)
@@ -114,6 +114,15 @@ Pressing the board's **BOOT** button (GPIO0) switches the display to the next st
 3. The header shows the current stop and position, e.g. `15889 2/3`.
 
 Stop list: `--stops` if given, else `default_stops` from the server (`GET /` → 6539, 15889, 6712); the bridge always starts at `--stop` (6539). Any stop works since the server answers `/buses?stop=<uid>`. The choice isn't persisted: restarting the bridge returns to `--stop`.
+
+### Paging (more than 4 routes)
+
+The OLED fits 4 routes. When a stop has more, the bridge shows them 4 at a time and advances one page per frame push (every `--every` = 5 s), wrapping around; e.g. 15889 with 15 routes → 4 pages, a full cycle every 20 s. Data is still fetched every push, so minutes stay fresh on every page.
+
+- Order: nearest arrival first, taken at the start of each cycle (page 1) and kept for the remaining pages, so page 1 always has the soonest buses and a route never jumps between pages (shown twice or skipped) because its ETA changed mid-cycle. Routes that vanish are dropped; new ones are appended to the last page; the next cycle re-sorts.
+- Header while paging: `<stop> p<page>/<pages>`, e.g. `15889 p2/4` (the stop position `2/3` is dropped so it fits 128 px next to the clock). With ≤ 4 routes nothing changes: `6539 1/3`, re-sorted every push.
+- A BOOT press always starts the next stop at page 1.
+- Bridge only, no firmware change.
 
 Serial protocol, board → host: `OK` (frame drawn), `BTN` (button), `I2C device at 0x..` (boot scan); unknown lines are ignored. `?` returns the firmware version (`NStupido OLED v3`).
 
@@ -145,7 +154,7 @@ Don't open serial monitor while bridge holds the port.
 python3 -m unittest discover -s tests -v          # offline + live
 python3 -m unittest tests.test_schedule -v        # offline only
 python3 -m unittest tests.test_live_sources -v    # upstream only
-python3 -m unittest tests.test_bridge -v          # bridge: stop cycling, serial input
+python3 -m unittest tests.test_bridge -v          # bridge: stop cycling, serial input, paging
 ```
 
 Offline: day type, midnight, schedule change, matching, feeders (`tests/fixtures/`).

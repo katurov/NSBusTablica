@@ -16,6 +16,9 @@ Button: the board sends `BTN` over the same serial link when its BOOT button
 `--stops` if given, else the server's `default_stops` (GET /), and always
 starts at `--stop`.
 
+Paging: a stop with more than 4 routes is shown 4 routes at a time, one page
+per push (every --every s); the header then reads `H|15889 p2/4|17:42`.
+
 Usage: python3 oled_bridge.py [--stop 6539] [--stops 6539,15889,6712] [--port /dev/cu.usbmodem01]
 """
 import argparse, glob, json, os, signal, subprocess, sys, time, urllib.error, urllib.request
@@ -150,16 +153,15 @@ def count_presses(lines):
     return sum(1 for ln in lines if ln.upper() in ("BTN", "NEXT"))
 
 
-def build_frame(data, stop, max_rows=4, label=None):
-    """Text frame for the board; `label` (e.g. "6539 1/3") replaces the stop in the header."""
+def route_rows(data):
+    """[(line, "R|line|cells")] for every route at the stop, nearest arrival first."""
     buses = data.get("buses") or []
+    key = lambda b: b.get("seconds") if b.get("seconds") is not None else 10**9
     by_line = {}
-    for b in sorted(buses, key=lambda b: b.get("seconds") if b.get("seconds") is not None else 10**9):
+    for b in sorted(buses, key=key):
         by_line.setdefault(b.get("line") or "?", []).append(b)
-    lines = sorted(by_line.items(),
-                   key=lambda kv: kv[1][0].get("seconds") if kv[1][0].get("seconds") is not None else 10**9)[:max_rows]
-    out = [f"H|{label or stop}|{datetime.now().strftime('%H:%M')}"]
-    for line, bl in lines:
+    rows = []
+    for line, bl in sorted(by_line.items(), key=lambda kv: key(kv[1][0])):
         cells = []
         for b in bl[:2]:
             secs = b.get("seconds")
@@ -172,9 +174,60 @@ def build_frame(data, stop, max_rows=4, label=None):
             else:
                 tag = "P"
             cells.append(f"{tag}:{mins}")
-        out.append("|".join(["R", line[:5]] + cells))
-    out.append("E")
-    return out
+        rows.append((line, "|".join(["R", line[:5]] + cells)))
+    return rows
+
+
+def frame_from_rows(label, rows):
+    return [f"H|{label}|{datetime.now().strftime('%H:%M')}"] + list(rows) + ["E"]
+
+
+def build_frame(data, stop, max_rows=4, label=None):
+    """Text frame for the board (first `max_rows` routes); `label` replaces the stop in the header."""
+    return frame_from_rows(label or stop, [r for _, r in route_rows(data)[:max_rows]])
+
+
+class Pager:
+    """Pages of `per_page` routes, one page per frame push, wrapping around.
+
+    The route order is taken nearest-first at the start of each cycle (page 1)
+    and then kept for the remaining pages, so a route never jumps between pages
+    (shown twice or skipped) just because its ETA changed mid-cycle. Routes
+    that vanish are dropped, new ones are appended at the end. With <= per_page
+    routes there is a single page, re-sorted every push (old behaviour).
+    """
+
+    def __init__(self, per_page=4):
+        self.per_page = per_page
+        self.reset()
+
+    def reset(self):
+        self.order = []
+        self.page = 0
+
+    def next_page(self, rows):
+        """rows from route_rows() -> (rows of the page to show, page index, page count)."""
+        by_name = dict(rows)
+        names = [n for n, _ in rows]
+        if self.page == 0 or not self.order:
+            self.order = names
+        else:
+            self.order = [n for n in self.order if n in by_name] + \
+                         [n for n in names if n not in self.order]
+        pages = max(1, -(-len(self.order) // self.per_page))
+        if self.page >= pages:              # routes disappeared: restart the cycle
+            self.page, self.order = 0, names
+        shown = self.page
+        chunk = self.order[shown * self.per_page:(shown + 1) * self.per_page]
+        self.page = (shown + 1) % pages
+        return [by_name[n] for n in chunk], shown, pages
+
+
+def header_label(cycler, page, pages):
+    """'6539 1/3' normally; '15889 p2/4' when paging (stop position dropped to fit 128 px)."""
+    if pages > 1:
+        return f"{cycler.current} p{page + 1}/{pages}"
+    return cycler.label()
 
 
 def open_serial(port):
@@ -210,6 +263,7 @@ def main():
     proc = None
     ser = None
     reader = LineReader()
+    pager = Pager(per_page=4)
     try:
         while True:
             try:
@@ -229,10 +283,12 @@ def main():
                     reader = LineReader()
                 stop = cycler.current
                 data = fetch(server, stop)
-                frame = build_frame(data, stop, label=cycler.label())
+                rows, page, pages = pager.next_page(route_rows(data))
+                label = header_label(cycler, page, pages)
+                frame = frame_from_rows(label, rows)
                 ser.write(("\n".join(frame) + "\n").encode("ascii", "replace"))
                 ser.flush()
-                print(datetime.now().strftime("%H:%M:%S"), f"[{cycler.label()}]",
+                print(datetime.now().strftime("%H:%M:%S"), f"[{label}]",
                       " ".join(frame[1:-1]) or "(nema autobusa)", flush=True)
                 if a.once:
                     break
@@ -248,6 +304,7 @@ def main():
                     if presses:
                         for _ in range(presses):
                             cycler.next()
+                        pager.reset()               # next stop starts at page 1
                         print(datetime.now().strftime("%H:%M:%S"),
                               f"button -> stop {cycler.label()}", flush=True)
                         break           # push the new stop's frame now
