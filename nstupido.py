@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""NStupido v4 - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops: live data + memory + official timetable
-(gspns.rs), served as JSON and as text frames for the WiFi OLED board.
+"""NStupido v4.1 - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops: live data + memory + official timetable
+(gspns.rs), served as JSON and as text frames for the WiFi OLED board. Any stop works: its lines come from the
+nsmart station list, their direction from the gspns network map (routes.py), missing timetables are fetched on the
+first request. Display: base route only (14S -> 14, 1GL -> 1), letters only for distinct routes (3A, 7B, 18A).
 
 CLI:     python3 nstupido.py [STOP_UID ...] [--merge] [--pretty] [--no-schedule | --schedule-only] [--no-feeders]
 Server:  python3 nstupido.py --serve [--config config.toml] [--host 0.0.0.0] [--port 8080]
@@ -11,7 +13,8 @@ Server:  python3 nstupido.py --serve [--config config.toml] [--host 0.0.0.0] [--
          Codes: 200 (maybe "warming": true / "live": false), 400 bad uid, 404 no such stop in nsmart,
                 429 queue full (Retry-After), 503 starting (Retry-After).
 
-Everything except the gspns timetable cache (cache/gspns/) lives in memory. nsmart is polled by one queue:
+Everything except the reference caches (cache/gspns/ timetables + network map, cache/nsmart/ station list) lives in
+memory. nsmart is polled by one queue:
 each watched stop followed by its feeder stops, spacing max(0.4 s, 40 s / N), at most 100 requests per 40 s
 cycle, global exponential backoff 5..180 s. Config: config.toml. Logs: syslog (daemon, ident nstupido) + stderr.
 
@@ -29,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import timetable                                   # noqa: E402  (vendored, same directory)
+import routes                                      # noqa: E402
 
 API_URL = "https://online.nsmart.rs/sr/najava-dolaska/"
 DEFAULT_STOPS = [
@@ -41,9 +45,7 @@ DEFAULT_STOPS = [
 # 15889: its predecessors are the suburban terminals, which only list planned departures -> no feeders.
 SEED_FEEDERS = {"6539": ["6540", "6750", "6679"], "6712": ["6586", "6728"], "15889": []}
 FEEDERS_PER_STOP = 4
-STATIONS_URL = "https://online.nsmart.rs/sr/AnnouncementForStation/getAllStations"
-STATIONS_CACHE = os.path.join(HERE, "stations_cache.json")
-STATIONS_MAX_AGE = 7 * 24 * 3600
+STATIONS_URL = routes.STATIONS_URL
 TRUNCATED_LEN = 50             # upstream cuts station_name in arrival responses to 50 chars
 KNOWN_NAMES = {                # full names (from getAllStations) for the default stops
     "6539": "Bulevar kralja Petra prvog-Mašinska škola",
@@ -121,36 +123,43 @@ def fetch_raw(stop_uid):
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return json.loads(r.read().decode("utf-8"))
 
-_names, _names_lock = None, threading.Lock()
+def fetch_stations():
+    """nsmart getAllStations (one ~1.5 MB request; every stop with coordinates and lines_for_station)."""
+    req = urllib.request.Request(STATIONS_URL, data=b"", headers={
+        "User-Agent": "Mozilla/5.0 (NStupido home board)", "X-Requested-With": "XMLHttpRequest"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+NAMING = routes.Naming()
+STATIONS = routes.Stations(fetch=fetch_stations)
+_stations_lock = threading.Lock()
+
+
+def ensure_stations(stations=None, gate=None):
+    """The station list is needed right away (names, lines of a new stop): fetch it once if there is no cache at
+    all (an old cache waits for the 14-day rule)."""
+    stations = stations or STATIONS
+    with _stations_lock:
+        if stations.fetched is None and not stations.stations and not getattr(stations, "_tried", False):
+            stations._tried = True
+            (gate or GATE).wait()
+            ok = stations.refresh()
+            LOG.info("station list: %s", "fetched (%d stops)" % len(stations.stations) if ok else
+                     "FAILED (%s)" % stations.last_error)
+    return stations
+
 
 def full_name(uid, name):
     """Upstream truncates station_name to 50 chars; restore the full name from the stop list."""
-    global _names
     if name is None or len(name) < TRUNCATED_LEN:
         return name
     if uid in KNOWN_NAMES:
         return KNOWN_NAMES[uid]
-    with _names_lock:
-        if _names is None:
-            _names = {}
-            try:
-                if os.path.exists(STATIONS_CACHE) and time.time() - os.path.getmtime(STATIONS_CACHE) < STATIONS_MAX_AGE:
-                    with open(STATIONS_CACHE, encoding="utf-8") as f:
-                        _names = json.load(f)
-                else:
-                    GATE.wait()
-                    req = urllib.request.Request(STATIONS_URL, data=b"", headers={
-                        "User-Agent": "Mozilla/5.0 (NStupido home board)", "X-Requested-With": "XMLHttpRequest"})
-                    with urllib.request.urlopen(req, timeout=30) as r:
-                        _names = {str(x["id"]): x["name"] for x in json.loads(r.read().decode("utf-8"))}
-                    try:
-                        with open(STATIONS_CACHE, "w", encoding="utf-8") as f:
-                            json.dump(_names, f, ensure_ascii=False)
-                    except OSError:
-                        pass
-            except Exception:
-                _names = {}
-    full = _names.get(uid)
+    try:
+        full = ensure_stations().name(uid)
+    except Exception:
+        full = None
     return full if full and full.startswith(name) else name
 
 def fetch(stop_uid):
@@ -201,6 +210,7 @@ def parse(stop_uid, d):
         ids = [str(s.get("id")) for s in st]
         out["buses"].append({
             "line": e.get("line_number"),
+            "actual": e.get("actual_line_number"),             # e.g. "542B": route 54, variant 2, direction B
             "direction": e.get("to_price"),
             "seconds": _int(e.get("seconds_left")) or 0,
             "stops_between": _int(e.get("stations_between")),
@@ -251,9 +261,10 @@ class Memory:
     """Remembers buses per stop, estimates their countdown between snapshots, learns routes / travel times and
     merges the official timetable into the board. Thread-safe."""
 
-    def __init__(self, tt=None):
+    def __init__(self, tt=None, naming=None):
         self.lock = threading.RLock()
         self.tt = tt                 # timetable.Timetables or None
+        self.naming = naming or NAMING
         self.stops = {}              # uid -> {"name", "fetched_at", "error", "buses": {key: entry}}
         self.vehicles = {}           # garage_no -> {"dep", "next_station", "line", "lat", "lng", "current_stop", "t"}
         self.learn = {"tt": {}, "travel": {k: list(v) for k, v in SEED_TRAVEL.items()}, "recorded": {},
@@ -269,7 +280,7 @@ class Memory:
                 ids = b.get("_ids") or []
                 if not ids or not b.get("line"):
                     continue
-                self.learn["routes"]["%s|%s" % (b["line"], ids[0])] = {"ids": ids, "t": now}
+                self.learn["routes"]["%s|%s" % (b["line"], ids[0])] = {"ids": ids, "tt": list(b.get("_tt") or []), "t": now}
                 if b.get("direction"):
                     self.learn["to"][b["line"]] = b["direction"]
                 for uid in self.stops.keys() | set(DEFAULT_STOPS):
@@ -331,6 +342,14 @@ class Memory:
         """Expected seconds from scheduled departure to arrival at uid for an nsmart line name."""
         with self.lock:
             tts = [v["tt"] for k, v in self.learn["tt"].items() if k.startswith("%s|%s|" % (uid, line))]
+            if not tts:
+                # any bus of this line seen anywhere (feeders, other stops) whose route passes uid: its scheduled
+                # minutes terminal -> uid (nsmart all_stations[].tt_time)
+                for k, r in self.learn["routes"].items():
+                    if k.startswith(line + "|") and uid in r["ids"]:
+                        i = r["ids"].index(uid)
+                        if i < len(r.get("tt") or []) and r["tt"][i] is not None:
+                            tts.append(r["tt"][i])
             samples = list(self.learn["travel"].get("%s|%s" % (uid, line), []))
         tt = statistics.median(tts) if tts else cfg_tt
         if tt is None:
@@ -441,6 +460,9 @@ class Memory:
                 out.append(t)
         return out
 
+    def _base_of(self, line, uid):
+        return self.tt.base_of(line, uid) if hasattr(self.tt, "base_of") else timetable.base_of(line, uid)
+
     def _match(self, uid, entries, sched, now):
         """Assign scheduled trips to remembered buses; returns set of taken trip_ids."""
         by_id = {t["trip_id"]: t for t in sched}
@@ -456,7 +478,7 @@ class Memory:
                 pending.append(e)
         # exact: same base line and departure within +-1 min
         for e in pending:
-            base = timetable.base_of(e["line"], uid)
+            base = self._base_of(e["line"], uid)
             d = dep_datetime(e.get("dep"), now)
             if not base or d is None:
                 continue
@@ -474,7 +496,7 @@ class Memory:
         for e in pending:
             if e.get("trip_id"):
                 continue
-            base = timetable.base_of(e["line"], uid)
+            base = self._base_of(e["line"], uid)
             if not base:
                 continue
             exp = now + e["_est"]
@@ -518,7 +540,8 @@ class Memory:
                     if e.get("pos") and v.get("next_station"):
                         sb = max(0, e["pos"] - v["next_station"])
                 status = "live" if now - e["seen_at"] <= LIVE_MAX_AGE else "lost"
-                buses.append({"line": e["line"], "direction": e["direction"], "minutes": est // 60,
+                buses.append({"line": self.naming.display(e["line"]), "nsmart_line": e["line"],
+                              "direction": e["direction"], "minutes": est // 60,
                               "seconds": est, "stops_between": sb, "garage_no": e["garage_no"],
                               "lat": lat, "lng": lng, "current_stop": cur,
                               "live": status == "live", "last_seen": int(now - e["seen_at"]),
@@ -533,12 +556,13 @@ class Memory:
                 if not (now - SCHED_GRACE <= t["expected"] <= now + SCHED_AHEAD):
                     continue
                 est = max(0, int(round(t["expected"] - now)))
-                buses.append({"line": t["line"], "direction": self.learn["to"].get(t["line"]) or timetable.destination(t["header"]),
+                buses.append({"line": self.naming.display(t["line"]), "nsmart_line": t["line"],
+                              "direction": self.learn["to"].get(t["line"]) or timetable.destination(t["header"]),
                               "minutes": est // 60, "seconds": est, "stops_between": None, "garage_no": None,
                               "lat": None, "lng": None, "current_stop": None, "live": False, "last_seen": None,
                               "status": "scheduled", "label": LABELS["scheduled"],
                               "scheduled_departure": t["dep"].strftime("%H:%M"), "expected": _hm(t["expected"]),
-                              "variant": t["mark"], "trip_id": t["trip_id"]})
+                              "variant": t["mark"], "trip_id": t["trip_id"], "entry": t.get("source", "manual")})
             order = {"live": 0, "lost": 1, "scheduled": 2}
             buses.sort(key=lambda b: (b["seconds"], order[b["status"]]))
             out = {"stop": {"uid": uid, "name": st["name"]}, "timestamp": _iso(now),
@@ -583,6 +607,7 @@ DEFAULT_CONFIG = {
     "polling": {"cycle_s": 40, "min_interval_s": 0.4, "watch_ttl_h": 4, "backoff_min_s": 5, "backoff_max_s": 180,
                 "assumed_feeders": 3},
     "timetable": {"refresh_at": "05:00", "pause_s": [1, 2], "retry_min": 15, "retries": 3},
+    "reference": {"max_age_days": 14, "start_delay_min": 60},
     "logging": {"stats_every_h": 12, "errors_every_min": 30},
 }
 
@@ -887,6 +912,8 @@ class TimetableRefresher:
         if timetable_due(self.tt.refreshed_at(), now, self.at):
             ok = self.tt.refresh(today=now.date(), force=True, stops=set(self.svc.watch.stops()))
             r = self.tt.last_result or {}
+            if hasattr(self.tt, "known_bases"):
+                NAMING.update(self.tt.known_bases())
             LOG.info("timetable refresh: %s, %d fetched, %d failed%s", "ok" if ok else "FAILED", r.get("fetched", 0),
                      r.get("failed", 0), "" if ok else " (%s)" % self.tt.last_error)
             self.svc.ready.set()
@@ -898,11 +925,62 @@ class TimetableRefresher:
         return max(1.0, (next_mark(self.now_dt(), self.at) - self.now_dt()).total_seconds())
 
 
+class ReferenceRefresher:
+    """nsmart station list + gspns network map (slow-changing). 14-day rule: a cache older than max_age (or
+    missing) is refreshed one hour after server start; long-running servers re-check the age daily at
+    `refresh_at` (05:00, right after the timetables). A failed refresh keeps the old cache."""
+
+    def __init__(self, service, cfg, clock=time.time, now_dt=None):
+        rc = cfg.get("reference") or DEFAULT_CONFIG["reference"]
+        self.svc, self.clock = service, clock
+        self.max_age_s = float(rc["max_age_days"]) * 86400
+        self.delay_s = float(rc["start_delay_min"]) * 60
+        self.at = cfg["timetable"]["refresh_at"]
+        tz = local_tz(cfg["server"]["timezone"])
+        self.now_dt = now_dt or (lambda: datetime.now(tz))
+        self.started = clock()
+        self.log = []                                # [(what, ok)] for tests / debug
+
+    def due(self, fetched):
+        return routes.cache_due(fetched, self.clock(), self.started, self.max_age_s, self.delay_s)
+
+    def step(self):
+        """Refresh what is due; -> seconds until the next check (start + 1 h, then every `refresh_at`)."""
+        if self.clock() - self.started < self.delay_s:
+            return self.started + self.delay_s - self.clock()
+        svc, changed = self.svc, False
+        st = svc.stations
+        if st is not None and self.due(st.fetched):
+            svc.gate.wait()
+            ok = st.refresh()
+            self.log.append(("stations", ok))
+            LOG.info("station list refresh: %s", "ok (%d stops)" % len(st.stations) if ok else "FAILED, keeping old (%s)" % st.last_error)
+            changed = changed or ok
+        mp = svc.netmap
+        if mp is not None and mp._fetch is not None and self.due(mp.fetched):
+            ok = mp.refresh()
+            self.log.append(("map", ok))
+            LOG.info("network map refresh: %s", "ok (%d buttons)" % len(mp.buttons) if ok else "FAILED, keeping old (%s)" % mp.last_error)
+            changed = changed or ok
+        if changed and svc.resolver is not None:
+            svc.resolver.invalidate()
+            for uid in svc.watch.stops():
+                svc.want_timetables(uid)
+        nxt = next_mark(self.now_dt(), self.at) + timedelta(minutes=10)     # after the 05:00 timetable refresh
+        return max(1.0, (nxt - self.now_dt()).total_seconds())
+
+
 # ---------------- service: queue, polling, answers ----------------
 class Service:
-    def __init__(self, cfg, mem, fetch_fn=None, gate=None, clock=time.time, sleep=time.sleep, use_feeders=True):
+    def __init__(self, cfg, mem, fetch_fn=None, gate=None, clock=time.time, sleep=time.sleep, use_feeders=True,
+                 resolver=None, stations=None, netmap=None):
         pol = cfg["polling"]
         self.cfg, self.mem = cfg, mem
+        self.resolver, self.stations, self.netmap = resolver, stations, netmap
+        self.tt_pending = set()                   # stops waiting for missing gspns timetables (-> warming)
+        self.tt_retry = {}                        # uid -> time of the next attempt after a failure
+        self.tt_later = set()
+        self.tt_cond = threading.Condition()
         self.fetch = fetch_fn or fetch
         self.gate = gate or GATE
         self.clock, self.sleep = clock, sleep
@@ -964,12 +1042,91 @@ class Service:
                 return "full"
             self.watch.add(uid)
             self.urgent.append(uid)
-            return "new"
+        self.want_timetables(uid)
+        return "new"
 
     def warming(self, uid):
+        with self.tt_cond:
+            if uid in self.tt_pending:
+                return True
         with self.mem.lock:
             st = self.mem.stops.get(uid)
             return not (st and st.get("fetched_at"))
+
+    # -- gspns timetables for new stops / new routes --
+    def want_timetables(self, uid):
+        """Queue `uid` for the timetable worker if some of its lines were never fetched."""
+        tt = self.mem.tt
+        if tt is None or not hasattr(tt, "missing"):
+            return False
+        if self.stations is not None and uid not in self.watch.defaults:
+            ensure_stations(self.stations, self.gate)
+        if not tt.missing([uid]):
+            return False
+        with self.tt_cond:
+            self.tt_pending.add(uid)
+            self.tt_cond.notify_all()
+        return True
+
+    def timetable_step(self):
+        """Fetch missing timetables for one pending stop (sequential, gspns pacing). -> True if it did work."""
+        tt = self.mem.tt
+        now = self.clock()
+        with self.tt_cond:
+            todo = [u for u in self.tt_pending if self.tt_retry.get(u, 0) <= now]
+        if not todo:
+            return False
+        uid = todo[0]
+        if not self.watch.is_watched(uid):
+            with self.tt_cond:
+                self.tt_pending.discard(uid)
+            return True
+        miss = tt.missing([uid])
+        ok = bad = 0
+        if miss:
+            ok, bad = tt.ensure([uid])
+            NAMING.update(tt.known_bases())
+            LOG.info("timetables for stop %s: %s (%s)", uid, "ok" if not bad else "FAILED, retry in %d min" %
+                     (self.cfg["timetable"]["retry_min"]), ", ".join("%s %s" % (rv, ",".join(sorted(b))) for rv, b in miss.items()))
+        with self.tt_cond:
+            self.tt_pending.discard(uid)          # answer without the missing timetable meanwhile (not warming forever)
+            if bad:
+                self.tt_retry[uid] = now + self.cfg["timetable"]["retry_min"] * 60
+                self.tt_later.add(uid)
+            else:
+                self.tt_retry.pop(uid, None)
+        return True
+
+    def timetable_forever(self):
+        while not self.stopping.is_set():
+            try:
+                for uid in list(self.tt_later):
+                    if self.tt_retry.get(uid, 0) <= self.clock():
+                        self.tt_later.discard(uid)
+                        if self.watch.is_watched(uid):
+                            self.want_timetables(uid)
+                if not self.timetable_step():
+                    with self.tt_cond:
+                        self.tt_cond.wait(5)
+            except Exception as e:
+                LOG.info("timetable worker error: %r", e)
+                self.stopping.wait(30)
+
+    def observe_live(self, buses):
+        """Routes seen live but unknown for a watched stop on their route: learn the direction from nsmart's
+        actual_line_number (trailing 'B' = direction B) and fetch the timetable."""
+        if self.resolver is None:
+            return
+        watched = set(self.watch.stops())
+        for b in buses:
+            if b.get("planned") or not b.get("line"):
+                continue
+            for w in watched.intersection(b.get("_ids") or []):
+                base = self.resolver.observe(w, b["line"], b.get("actual"))
+                if base:
+                    LOG.info("stop %s: route %s seen live (%s, direction %s), not in map/timetables - learning", w,
+                             base, b.get("actual"), "B" if str(b.get("actual") or "").endswith("B") else "A")
+                    self.want_timetables(w)
 
     def answer(self, uid):
         live = not self.gate.in_backoff()
@@ -994,6 +1151,7 @@ class Service:
         else:
             self.gate.success()
         self.mem.observe_routes(r.get("buses", []), self.clock())
+        self.observe_live(r.get("buses", []))
         return r
 
     def _mark_missing(self, uid):
@@ -1088,6 +1246,29 @@ class Service:
                 self.sleep(5)
 
     # -- logging --
+    def record_http(self, ip, path, status):
+        """No access log (the board asks every 5 s): count (path, status), log a client's first request once."""
+        p = urllib.parse.urlparse(path or "")
+        key = "%s %d" % (p.path or "/", status)
+        with self.lock:
+            if not hasattr(self, "http"):
+                self.http, self.http_clients = collections.Counter(), {}
+            self.http[key] += 1
+            first = ip not in self.http_clients
+            self.http_clients[ip] = {"last": "%s?%s -> %d" % (p.path, p.query, status) if p.query else
+                                     "%s -> %d" % (p.path, status), "at": _iso(self.clock())}
+        if first:
+            LOG.info("client %s first request: %s", ip, self.http_clients[ip]["last"])
+
+    def http_line(self):
+        with self.lock:
+            c = getattr(self, "http", None)
+            if not c:
+                return None
+            line = "http: %s" % ", ".join("%s x%d" % (k, n) for k, n in sorted(c.items(), key=lambda kv: -kv[1]))
+            c.clear()
+        return line
+
     def stats_line(self):
         st = self.watch.stops()
         nd = len(self.watch.defaults)
@@ -1102,6 +1283,12 @@ class Service:
             line = self.errors.flush(self.gate.backoff_s())
             if line:
                 LOG.info(line)
+            if self.clock() - getattr(self, "_http_at", 0) >= self.cfg["logging"]["errors_every_min"] * 60:
+                if getattr(self, "_http_at", 0):
+                    line = self.http_line()
+                    if line:
+                        LOG.info(line)
+                self._http_at = self.clock()
             if self.clock() - last_stats >= every:
                 last_stats = self.clock()
                 LOG.info(self.stats_line())
@@ -1118,7 +1305,8 @@ class Service:
                           "cycle_s": self.cycle_s},
                 "backoff": {"active": self.gate.in_backoff(), "failures": self.gate.failures,
                             "seconds": self.gate.backoff_s()},
-                "ready": self.ready.is_set()}
+                "ready": self.ready.is_set(),
+                "http": dict(getattr(self, "http", {})), "clients": dict(getattr(self, "http_clients", {}))}
 
 
 # ---------------- board frame (text, same protocol as the USB bridge) ----------------
@@ -1160,7 +1348,7 @@ SERVICE = None                                  # set by serve()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NStupido/4.0"
+    server_version = "NStupido/4.1"
     service = None                              # tests may set a class attribute; default: SERVICE
 
     @property
@@ -1168,6 +1356,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.service or SERVICE
 
     def _send(self, status, obj, headers=None, text=None):
+        try:
+            self.svc.record_http(self._client_ip(), self.path, status)
+        except Exception:
+            pass
         body = (text if text is not None else dumps(obj)).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8" if text is not None else "application/json; charset=utf-8")
@@ -1221,7 +1413,15 @@ class Handler(BaseHTTPRequestHandler):
             with mem.lock:
                 learn = {"travel": mem.learn["travel"], "tt": mem.learn["tt"], "names": mem.learn["names"]}
                 arr = mem.arrivals[-50:]
+            lines = {}
+            if svc.resolver is not None:
+                for s_ in svc.watch.stops():
+                    lines[s_] = {"entries": svc.resolver.describe(s_), "derivation": svc.resolver.info.get(s_),
+                                 "manual": s_ in svc.resolver.manual}
             return self._send(200, {"timestamp": _iso(), "timetable": mem.tt.status() if mem.tt else None,
+                                    "lines": lines, "pending_timetables": sorted(svc.tt_pending),
+                                    "reference": {"stations_fetched": svc.stations.fetched if svc.stations else None,
+                                                  "map_fetched": svc.netmap.fetched if svc.netmap else None},
                                     "feeders": {s: svc.feeders_of(s) for s in svc.watch.stops()},
                                     "missing": list(svc.missing), "learn": learn, "arrivals": arr})
         if p not in ("/buses", "/frame"):
@@ -1245,6 +1445,25 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------- main ----------------
+def _age(ts):
+    return "missing" if not ts else "%.1f days old" % ((time.time() - ts) / 86400)
+
+
+def build_service(cfg, tt, use_feeders=True, stations=None, netmap=None, fetch_fn=None, gate=None,
+                  clock=time.time, sleep=time.sleep):
+    """Service + the stop -> lines resolver (manual STOP_LINES for the default stops, derived otherwise)."""
+    stations = stations or STATIONS
+    netmap = netmap or routes.NetworkMap(fetch=(tt.fetch if tt is not None else None))
+    resolver = None
+    if tt is not None:
+        NAMING.update(tt.known_bases())
+        resolver = routes.Resolver(NAMING, stations, netmap, manual=timetable.STOP_LINES,
+                                   rv_of=lambda b: tt.known_bases().get(b))
+        tt.resolver = resolver
+    return Service(cfg, Memory(tt), fetch_fn=fetch_fn, gate=gate, clock=clock, sleep=sleep, use_feeders=use_feeders,
+                   resolver=resolver, stations=stations, netmap=netmap)
+
+
 def serve(cfg, host, port, use_schedule=True, use_feeders=True):
     global SERVICE
     tc = cfg["timetable"]
@@ -1252,7 +1471,7 @@ def serve(cfg, host, port, use_schedule=True, use_feeders=True):
     tt = timetable.Timetables(pause=lambda: time.sleep(random.uniform(*pause))) if use_schedule else None
     GATE.min_interval = float(cfg["polling"]["min_interval_s"])
     GATE.backoff_min, GATE.backoff_max = float(cfg["polling"]["backoff_min_s"]), float(cfg["polling"]["backoff_max_s"])
-    svc = SERVICE = Service(cfg, Memory(tt), use_feeders=use_feeders)
+    svc = SERVICE = build_service(cfg, tt, use_feeders=use_feeders)
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
 
@@ -1276,6 +1495,21 @@ def serve(cfg, host, port, use_schedule=True, use_feeders=True):
                     d = 900
                 svc.stopping.wait(d)
         threading.Thread(target=tt_loop, daemon=True, name="timetable").start()
+        threading.Thread(target=svc.timetable_forever, daemon=True, name="timetables-new").start()
+        refs = ReferenceRefresher(svc, cfg)
+
+        def ref_loop():
+            while not svc.stopping.is_set():
+                try:
+                    d = refs.step()
+                except Exception as e:
+                    LOG.info("reference refresh error: %r", e)
+                    d = 3600
+                svc.stopping.wait(d)
+        threading.Thread(target=ref_loop, daemon=True, name="reference").start()
+        LOG.info("reference caches: station list %s, network map %s (refresh if older than %g days, %g min after start "
+                 "and daily at %s)", _age(STATIONS.fetched), _age(svc.netmap.fetched),
+                 refs.max_age_s / 86400, refs.delay_s / 60, cfg["timetable"]["refresh_at"])
     else:
         svc.ready.set()
     threading.Thread(target=svc.poll_forever, daemon=True, name="poller").start()
@@ -1323,8 +1557,14 @@ def main():
             tt.maybe_refresh(min_interval=600)
         except Exception:
             pass
-    cfg["stops"]["default"] = stops
-    svc = Service(cfg, Memory(tt), use_feeders=not a.no_feeders)
+    cfg["stops"]["default"] = list(DEFAULT_STOPS)
+    svc = build_service(cfg, tt, use_feeders=not a.no_feeders)
+    for s in stops:
+        if s not in svc.watch.defaults:
+            svc.watch.add(s)
+            if tt is not None and svc.want_timetables(s):
+                while svc.timetable_step():
+                    pass
     if not a.schedule_only:
         fetched = {}
         for s in stops:                          # sequential, paced by GATE (>= 0.4 s apart)

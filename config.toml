@@ -22,6 +22,10 @@ pause_s = [1, 2]          # random pause between two gspns requests
 retry_min = 15            # failed refresh: retry after 15 min ...
 retries = 3               # ... up to 3 times
 
+[reference]               # slow-changing caches: nsmart station list (cache/nsmart/stations.json), gspns network map (cache/gspns/map.json)
+max_age_days = 14         # refresh a cache older than this (or missing) ...
+start_delay_min = 60      # ... 60 min after server start, and re-check daily at refresh_at (+10 min)
+
 [logging]
 stats_every_h = 12        # syslog stats line (stops, queue, unique client IPs)
 errors_every_min = 30     # aggregated nsmart error line, only if there were errors

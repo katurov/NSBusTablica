@@ -7,8 +7,9 @@ Home display for upcoming buses in GSP Novi Sad: live nsmart data + memory betwe
 - **Server** (`nstupido.py --serve`, config in `config.toml`) polls nsmart politely through one queue (≤ 1 request / 0.4 s, at most 100 per 40 s cycle), keeps everything in memory except the timetable cache, and serves JSON (`/buses`) plus ready-made text frames for the board (`/frame`).
 - **Board** connects to WiFi and fetches `GET <SERVER_URL>/frame?stop=<uid>` every 5 s; BOOT button cycles the compiled stop list; more than 4 routes → pages.
 - **USB bridge** (`oled_bridge.py`) is legacy/optional: the v4 firmware still draws frames arriving over USB serial.
+- **v4.1 – any stop:** ask for any nsmart stop and, after ~15 s of `"warming"`, get the full list: live buses (G/E) plus the official timetable (P) of *every* line through that stop. Lines come from the nsmart station list, their direction from the gspns network map, missing timetables are downloaded on the spot (paced). The board shows the **base route** only (`14S` → `14`, `1GL` → `1`); letters stay only where they name a different route (`3A`, `7B`, `18A`).
 
-Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md).
+Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md). Data sources, the route naming model and *why* things are done this way: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**.
 
 ## Project Structure
 
@@ -17,17 +18,20 @@ Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md).
 | `nstupido.py` | Core: fetch nsmart, memory, feeders, schedule merge, polling queue, HTTP server, CLI |
 | `config.toml` | Server config: default stops, host/port, polling limits, timetable refresh, logging |
 | `nstupido-server.sh` | Start/stop the server detached (`start`/`stop`/`restart`/`status`) |
-| `timetable.py` | Load/cache gspns.rs, day type, `STOP_LINES`, scheduled departures |
+| `timetable.py` | Load/cache gspns.rs, day type, hand-made `STOP_LINES` (default stops), scheduled departures, on-demand fetch of missing lines |
+| `routes.py` | Route naming (base / variant / direction), nsmart station list + gspns network map caches, stop → lines derivation, live learning |
+| `tools/compare_lines.py` | Offline check: automatic stop → lines derivation vs hand-made `STOP_LINES`, departure by departure |
 | `rs_holidays.py` | Republic of Serbia holidays (incl. Orthodox Easter) for fallback day type |
 | `firmware/` | PlatformIO project for the WiFi OLED board; `include/frame.h` = frame parser + pager (host-testable) |
 | `firmware/secrets.ini.example` | Template for the untracked `firmware/secrets.ini` (WiFi SSID / password) |
 | `oled_bridge.py` | Legacy USB bridge: reads `/buses`, sends frames over serial |
 | `tests/` | Offline unit tests (server, schedule, bridge, firmware frame) + live connectivity (`test_live_sources.py`) |
 | `docs/WIFI_PLAN.md` | v4 design and implementation notes |
+| `docs/DATA_SOURCES.md` | Sources, route naming model, how they are combined, caching / rate-limit / display decisions and why |
 | `HOW_TO_TEST_DATA.md` | Agent playbook: how to verify data is coming through |
 | `requirements.txt` | Optional deps (`pyserial` for the bridge, `tomli` on Python < 3.11 optional) |
-| `cache/gspns/` | **runtime**: timetable cache + index (the only persisted data) |
-| `stations_cache.json` | **runtime**: full stop names from getAllStations (fetched at most weekly) |
+| `cache/gspns/` | **runtime**: timetables + index (`timetable_<vaziod>.json`, `index.json`), network map (`map.json`) |
+| `cache/nsmart/stations.json` | **runtime**: nsmart station list (names, coordinates, lines per stop) |
 | `nstupido.log`, `nstupido.pid` | **runtime**: server log / PID when started with `nstupido-server.sh` |
 
 ## Data Sources
@@ -35,9 +39,11 @@ Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md).
 | Source | How | Auth |
 |---|---|---|
 | **nsmart** live | `POST https://online.nsmart.rs/sr/najava-dolaska/` (`station_uid`, …) | none |
-| **nsmart** names | `POST …/AnnouncementForStation/getAllStations` | none |
+| **nsmart** station list | `POST …/AnnouncementForStation/getAllStations` (names, coordinates, `lines_for_station`) | none |
 | **gspns** day type / vaziod | `GET http://gspns.rs/red-voznje/gradski` | none |
+| **gspns** line list | `GET …/red-voznje/lista-linija?rv=&vaziod=&dan=` | none |
 | **gspns** departures | `GET …/ispis-polazaka?rv=&vaziod=&dan=&linija[]=` | none |
+| **gspns** network map | `GET http://gspns.rs/mreza` (buttons) + `GET /mreza-get-stajalista-tacke?linija=<id>` (stops + labels) | none |
 | **holidays** | `rs_holidays.py` (RS law) | — |
 
 Endpoints are undocumented and may change without notice.
@@ -60,7 +66,7 @@ Endpoints are undocumented and may change without notice.
 
 15889 and 6712 are ~3 m apart, ~385 m from 6539. Other useful stops: 6551 (opposite 6539), 6709 (other side of boulevard).
 
-Any other stop: just ask for it (`/buses?stop=<uid>`, `/frame?stop=<uid>`, or add it to the board's `STOPS`); the server starts polling it (live + feeders) on the first request. Timetable (P) entries need a `STOP_LINES` entry in `timetable.py`; default stops: `[stops] default` in `config.toml`.
+Any other stop: just ask for it (`/buses?stop=<uid>`, `/frame?stop=<uid>`, or add it to the board's `STOPS`); the server starts polling it (live + feeders) on the first request and derives its lines automatically (station list + network map), fetching missing timetables right away. The three default stops keep their hand-made `STOP_LINES` in `timetable.py` as an override (the automatic derivation reproduces them, see [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md#automatic-vs-hand-made-lines)); default stops: `[stops] default` in `config.toml`.
 
 ## Server
 
@@ -82,20 +88,22 @@ Foreground (debug): `python3 nstupido.py --serve` (`--port`, `--host`, `--config
 ### Behaviour
 
 - **Watch list:** default stops (config) never expire. Any other stop is added on its first request and dropped 4 h after its last request (its feeders leave too, unless shared).
-- **Unknown stop:** answered immediately with what exists (timetable entries if configured, else empty) and `"warming": true`; it jumps the queue for its first live request. If nsmart says it doesn't exist → `404` afterwards.
+- **Unknown stop:** answered immediately with what exists and `"warming": true`; it jumps the queue for its first live request, and its lines are derived (nsmart `lines_for_station` → gspns map labels of the matching map stop → route, direction, variants). Timetables of lines never fetched before are downloaded at once (one request every 1–2 s, about 8 requests per kind of line) and `"warming"` stays on until they are in. If nsmart says the stop doesn't exist → `404` afterwards.
+- **Route seen live but unknown:** if a live bus passing a watched stop belongs to a route that the map/timetables don't place there, its direction is learned from nsmart `actual_line_number` (trailing `B` = direction B) and its timetable is fetched — without waiting for a map refresh.
+- **Reference caches:** the nsmart station list (`cache/nsmart/stations.json`) and the gspns network map (`cache/gspns/map.json`) change rarely. A cache older than 14 days (or missing) is refreshed 1 hour after server start, and the age is re-checked daily at 05:10 for long-running servers. A failed refresh keeps the old cache. Exception: with no station list at all, it is fetched once immediately (one request), because nothing works without it.
 - **Queue:** each stop is a group = the stop followed immediately by its feeder stops; shared feeders are requested once per cycle. With `N` requests per cycle the spacing is `max(0.4 s, 40 s / N)` (8 requests → one every 5 s). Capacity `40 / 0.4 = 100` requests per cycle; a new stop is accepted only if it fits (a never-seen stop is counted as 1 + 3 assumed feeders), else `429`. Watched stops are always served.
 - **Backoff:** global; after an nsmart failure the next request waits 5, 10, 20, 40, 80, 160 s, capped at 180 s; the first success resets it. Meanwhile clients get timetable-only data with `"live": false`.
-- **Rate guarantee:** every nsmart request (arrivals and the stop-name list) passes one gate with ≥ 0.4 s spacing; HTTP clients never trigger upstream requests directly.
-- **Logging:** syslog, facility `daemon`, ident `nstupido` (macOS `/var/run/syslog`, Linux `/dev/log`, fallback stderr) and a copy on stderr (`nstupido.log`). Lines: start / stop, timetable refresh result, `stats:` every 12 h (watched stops, queue length, unique client IPs in 12 h), `nsmart errors: 37 in last 30 min (timeout 30, http 503 7), backoff 180 s` at most every 30 min and only if there were errors. macOS: `log show --last 1h --predicate 'eventMessage CONTAINS "nstupido"'`; Linux: `journalctl -t nstupido`.
+- **Rate guarantee:** every nsmart request (arrivals and the station list) passes one gate with ≥ 0.4 s spacing; every gspns request (timetables, line lists, map) passes one lock with a random 1–2 s pause. HTTP clients never trigger upstream requests directly (they only queue work).
+- **Logging:** syslog, facility `daemon`, ident `nstupido` (macOS `/var/run/syslog`, Linux `/dev/log`, fallback stderr) and a copy on stderr (`nstupido.log`). Lines: start / stop, reference cache ages at start, timetable refresh result, `timetables for stop 6660: ok (rvg 1,12,6)`, station list / network map refresh results, `stop … route … seen live … learning`, `client <ip> first request: /frame?stop=6539 -> 200` (once per client; there is no access log), `http: /frame 200 x360, …` every 30 min, `stats:` every 12 h (watched stops, queue length, unique client IPs in 12 h), `nsmart errors: 37 in last 30 min (timeout 30, http 503 7), backoff 180 s` at most every 30 min and only if there were errors. macOS: `log show --last 1h --predicate 'eventMessage CONTAINS "nstupido"'`; Linux: `journalctl -t nstupido`.
 
 ### API
 
 | Request | Answer |
 |---|---|
-| `GET /` | usage, default stops, watch list with expiry, queue length/limit/interval, backoff state, ready |
+| `GET /` | usage, default stops, watch list with expiry, queue length/limit/interval, backoff state, ready, HTTP status counts, last request per client |
 | `GET /buses?stop=<uid>[,<uid>…][&merge=1]` | JSON (format below) |
 | `GET /frame?stop=<uid>` | text frame for the board (below) |
-| `GET /debug` | timetable status, feeders, learned travel times, recent arrivals |
+| `GET /debug` | timetable status, per watched stop: line entries + derivation (nsmart lines, matched map stop, labels, lines pending live), reference cache ages, feeders, learned travel times, recent arrivals |
 
 | Code | When |
 |---|---|
@@ -105,7 +113,7 @@ Foreground (debug): `python3 nstupido.py --serve` (`--port`, `--host`, `--config
 | `429` | queue full: `Retry-After: 600`, `{"error": "stop limit reached", "limit": 100}` |
 | `503` | starting, no timetable yet: `Retry-After: 10` (only on a first start without cache) |
 
-**Board frame** (`text/plain`, same line protocol as the USB bridge; all routes, nearest arrival first, max 24, line names ASCII-folded to 5 chars):
+**Board frame** (`text/plain`, same line protocol as the USB bridge; all routes, nearest arrival first, max 24; one row per base route — variants such as 1 / 1GL / 1J share a row — ASCII-folded to 5 chars):
 
 ```
 H|6539|12:33|W        stop | server time | flags: W = warming, O = offline (nsmart backoff)
@@ -130,7 +138,9 @@ Errors on `/frame` come as `ERR|<code>|<message>` with the same HTTP codes.
 | `polling.assumed_feeders` | 3 | capacity estimate for a never-seen stop |
 | `timetable.refresh_at` | `"05:00"` | daily gspns refresh (local) |
 | `timetable.pause_s` | `[1, 2]` | random pause between gspns requests |
-| `timetable.retry_min` / `retries` | 15 / 3 | retry after a failed refresh |
+| `timetable.retry_min` / `retries` | 15 / 3 | retry after a failed refresh (also: failed timetable fetch for a new stop) |
+| `reference.max_age_days` | 14 | station list / network map older than this are refreshed … |
+| `reference.start_delay_min` | 60 | … this long after start, then checked daily at `refresh_at` + 10 min |
 | `logging.stats_every_h` / `errors_every_min` | 12 / 30 | syslog cadence |
 
 Python 3.11+ reads it with `tomllib`; older Pythons use `tomli` if installed, else a built-in parser for this simple subset.
@@ -182,6 +192,8 @@ python3 -m unittest discover -s tests -v          # offline + live
 python3 -m unittest tests.test_server -v          # v4 server: queue math, groups, capacity/429, TTL, backoff,
                                                   # log aggregation, HTTP codes, timetable refresh schedule
 python3 -m unittest tests.test_schedule -v        # schedule, matching, feeders
+python3 -m unittest tests.test_routes -v          # v4.1: route names, map matching, mark rules, cache age rules,
+                                                  # new-stop flow, unknown live route, HTTP counters
 python3 -m unittest tests.test_bridge -v          # legacy bridge: stop cycling, serial input, paging
 python3 -m unittest tests.test_firmware_frame -v  # firmware frame.h parser + pager, compiled with c++ (skipped without a compiler)
 python3 -m unittest tests.test_live_sources -v    # upstream reachability (network)
@@ -199,16 +211,16 @@ The stop itself often returns empty, while the previous one on the route shows t
 
 ## Schedule (Brief)
 
-At startup (if the cache is older than today's 05:00) and daily at 05:00 Europe/Belgrade the day type is read from gspns + `vaziod`, and R/S/N/P timetables for the lines (`STOP_LINES`) of the watched stops are downloaded with a random 1–2 s pause between requests → `cache/gspns/` (atomic writes; the only data on disk). A failed part keeps the previous copy; a failed refresh is retried after 15 min, up to 3 times. Day type fallback: holiday → P, Sat → S, Sun → N, otherwise R. Trips after midnight belong to previous service day. Window ~40 min before ETA; 3 min after due without bus — removed. Matching with live by `entered_departure_time` ±1 min or nearest ±6 min. `--no-schedule` / `--schedule-only` (CLI).
+At startup (if the cache is older than today's 05:00) and daily at 05:00 Europe/Belgrade the day type is read from gspns + `vaziod`, and R/S/N/P timetables for the lines of **all watched stops** (default + dynamic; hand-made `STOP_LINES` or derived) are downloaded with a random 1–2 s pause between requests → `cache/gspns/` (atomic writes; the only data on disk). A failed part keeps the previous copy; a failed refresh is retried after 15 min, up to 3 times. Day type fallback: holiday → P, Sat → S, Sun → N, otherwise R. Trips after midnight belong to previous service day. Window ~40 min before ETA; 3 min after due without bus — removed. Matching with live by `entered_departure_time` ±1 min or nearest ±6 min. `--no-schedule` / `--schedule-only` (CLI).
 
 ## JSON Format
 
-Per-stop (default). v4 adds `"warming": true` (stop just added, no live answer yet) and `"live": false` (nsmart in backoff: timetable entries only):
+Per-stop (default). v4 adds `"warming": true` (stop just added: no live answer or timetables yet) and `"live": false` (nsmart in backoff: timetable entries only). v4.1: `line` is the displayed base route, `nsmart_line` the original variant name, `entry` (scheduled only) tells whether the line came from the hand-made table (`manual`), the network map (`map`) or live learning (`live`):
 
 ```json
 {"timestamp":"…","stops":[
   {"stop":{"uid":"6539","name":"…"},"timestamp":"…","buses":[
-    {"line":"8","direction":"Liman 1","minutes":3,"seconds":236,"stops_between":2,
+    {"line":"8","nsmart_line":"8","direction":"Liman 1","minutes":3,"seconds":236,"stops_between":2,
      "garage_no":"1119","lat":…,"lng":…,"current_stop":"…",
      "live":true,"last_seen":1,"status":"live","label":"Sveže",
      "scheduled_departure":"17:18","expected":"17:37","source":"via 6750","trip_id":"…"}
@@ -220,7 +232,7 @@ Per-stop (default). v4 adds `"warming": true` (stop just added, no live answer y
 
 | Field | Value |
 |---|---|
-| `line` / `direction` | Line and destination |
+| `line` / `nsmart_line` / `direction` | Displayed route (base), nsmart variant name, destination |
 | `minutes` / `seconds` | Until arrival |
 | `stops_between` | Stops until you (`null` for scheduled) |
 | `garage_no`, `lat`, `lng`, `current_stop` | Position (`null` for scheduled) |
@@ -235,8 +247,8 @@ For stop: `updated` — seconds since last successful upstream. On network error
 ## Notes
 
 - nsmart often has short horizon → memory, feeders, and schedule needed.
-- Line list for 6712/15889 partially presumed; 56 not included (per mreza doesn't pass here). Announcements on `gspns.rs/aktuelno` not read by script.
+- nsmart lists 54"A", 54ŽA, 56, 61, 62, 76 at 6712 and 56 at 15889, but the network map does not: they are not scheduled there until a live bus proves it (then learned). Announcements on `gspns.rs/aktuelno` not read by script.
 - `radius` doesn't affect arrival prediction (only nearest stop search).
-- Names in response truncated to 50 characters — restored from dictionary / `stations_cache.json`.
+- Names in response truncated to 50 characters — restored from the station list (`cache/nsmart/stations.json`; the old `stations_cache.json` is no longer used and can be deleted).
 - Find uid: `POST …/getAllStations` (fields `id`, `name`).
 - No mDNS (`nstupido.local`) in v4: the board uses `SERVER_URL` (DNS name or IP).

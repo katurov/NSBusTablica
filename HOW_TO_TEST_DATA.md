@@ -15,7 +15,13 @@ or schedule/memory only:
 python3 -m unittest tests.test_schedule -v
 ```
 
-**Pass** = day type, midnight, `vaziod` change, trip matching, feeders — logic OK.
+or route naming / new stops only:
+
+```bash
+python3 -m unittest tests.test_routes -v
+```
+
+**Pass** = day type, midnight, `vaziod` change, trip matching, feeders, route names (`14S` → `14`, `3A` stays), map matching, mark rules, 14-day cache rule, new-stop flow — logic OK.
 **Fail** = regression in code, not upstream. Fix code / fixtures in `tests/fixtures/`.
 
 ## 2. Live Connectivity (Network Required)
@@ -61,7 +67,7 @@ Symptoms:
 |---|---|
 | `error.type=network` / DNS / timeout | API/site unreachable from this machine |
 | `error.type=http` / `api` / `bad_response` | nsmart responded badly (not login HTML page — we have no auth) |
-| `buses:[]`, no errors, `--schedule-only` also empty | window without trips / `STOP_LINES` doesn't cover lines |
+| `buses:[]`, no errors, `--schedule-only` also empty | window without trips / no lines derived for that stop (check `/debug` → `lines.<uid>.derivation`: no `map_stop`? empty `nsmart_lines`?) |
 | Only `scheduled`, no `live`/`lost` | nsmart empty (often normal), schedule works |
 | Has `live` with `source:"via 6540"` | Feeders work, stop itself empty |
 
@@ -75,7 +81,7 @@ curl -sS "http://127.0.0.1:8080/buses?stop=6539" | python3 -m json.tool | head -
 curl -sS http://127.0.0.1:8080/debug | python3 -m json.tool | head -80
 ```
 
-`/debug` shows `timetable` (vaziod, day_type, last_error), feeders, learn.
+`/debug` shows `timetable` (vaziod, day_type, last_error), `lines` per watched stop (entries, derivation, `manual`), `pending_timetables`, `reference` cache stamps, feeders, learn.
 502 on `/buses` = all requested stops errored and nothing to show.
 
 ## 5. Direct Upstream Probes (If Tests Are Red)
@@ -103,14 +109,31 @@ curl -sS 'http://gspns.rs/red-voznje/ispis-polazaka?rv=rvg&vaziod=2026-10-01&dan
 1. Server running: `./nstupido-server.sh status` (start: `./nstupido-server.sh start`; on the Mac `PYTHON=/opt/homebrew/bin/python3.10`).
 2. Same URL the board uses: `curl -s http://nstupido.teamof.top:8080/` (200, `"ready": true`) and `curl -s "http://nstupido.teamof.top:8080/frame?stop=6539"` (lines `H|…`, `R|…`, `E`).
 3. Board log over USB (nothing else may hold the port): `pio device monitor` in `firmware/` → `[nstupido] GET http://…/frame?stop=6539 -> 200` every 5 s. `-1` = server unreachable (DNS / firewall / server down), `503` = server starting.
-4. Server side: `tail nstupido.log`; `GET /` shows queue, backoff, watch list.
+4. Server side: `tail nstupido.log` (`client 192.168.42.91 first request: /frame?stop=6539 -> 200`, `http: /frame 200 x360` every 30 min); `GET /` shows queue, backoff, watch list, `http` counts and the last request per client.
 5. Legacy USB bridge: `python3 oled_bridge.py --stop 6539` (requires `pyserial`); don't open the serial monitor at the same time.
 6. Brightness: `OLED_CONTRAST` in `firmware/platformio.ini` (currently 40 out of 255).
 
-## 7. Agent Success Checklist
+## 7. New Stop / Route Derivation (v4.1)
 
-- [ ] `python3 -c "import nstupido, timetable, rs_holidays"` without errors
-- [ ] Offline: `unittest discover -s tests` — `test_server`, `test_schedule`, `test_bridge`, `test_firmware_frame` green
+1. Ask for a stop that is not a default (busy city examples: 6660 Bulevar Mihajla Pupina-Pothodnik, 6678 Rumenačka-Kornelija Stankovića, 6685 Bulevar Cara Lazara-Urbis):
+
+   ```bash
+   for i in $(seq 12); do curl -s "http://127.0.0.1:8080/frame?stop=6660" | head -1; sleep 5; done
+   ```
+
+   Expect `H|6660|HH:MM|W` for ~15 s (live poll + paced timetable fetch), then no `W` and one `R|` row per base route.
+2. `tail nstupido.log` → `timetables for stop 6660: ok (rvg 1,12,6)` (only lines never cached are fetched).
+3. `curl -s http://127.0.0.1:8080/debug | python3 -c 'import json,sys; d=json.load(sys.stdin)["lines"]["6660"]; print(d["derivation"]); [print(e["base"], e["letter"], e["labels"], e["source"]) for e in d["entries"]]'`
+   → `map_stop` within a few metres, labels like `1A 1GLA 1JA 3B 4B 6B 6DB 8A 12A 18A`.
+4. `/buses?stop=6660`: `line` is the base route, `nsmart_line` the variant (`1GL`), scheduled entries have `entry: "map"`.
+5. Offline comparison of the automatic derivation with the hand-made `STOP_LINES` (no requests): `python3 tools/compare_lines.py [--date 2026-10-12] [6539 6712 15889]`. Expected today: identical for 6539 and 6712; 15889 differs by one `55 KN` weekday trip (see docs/DATA_SOURCES.md).
+6. Reference caches: `GET /debug` → `reference.stations_fetched` / `map_fetched` (epoch s); start log line `reference caches: station list 5.1 days old, network map 5.1 days old …`. They refresh 1 h after start only if older than 14 days.
+
+## 8. Agent Success Checklist
+
+- [ ] `python3 -c "import nstupido, timetable, routes, rs_holidays"` without errors
+- [ ] Offline: `unittest discover -s tests` — `test_server`, `test_schedule`, `test_routes`, `test_bridge`, `test_firmware_frame` green
+- [ ] A non-default stop warms up and then shows P rows for all its routes (§7)
 - [ ] Live: `tests.test_live_sources` — all 5 green (or clearly indicated that network from box/machine is unavailable)
 - [ ] CLI `nstupido.py 6539 --pretty` returns JSON with `stop` + `buses` (or meaningful `error`)
 - [ ] If needed: `/`, `/buses`, `/frame` and `/debug` respond 200

@@ -1,6 +1,6 @@
 # NStupido v4 plan: WiFi board, on-demand stops, polite polling
 
-Status: **implemented** (v4, 11 Oct 2026; see *Implementation notes* at the end for deviations). This is a research prototype built for fun, together with Grok Bot.
+Status: **implemented** (v4, 11 Oct 2026; see *Implementation notes* at the end for deviations), extended by **v4.1 – any stop** (section 11). This is a research prototype built for fun, together with Grok Bot. Data sources and the reasons behind the caching / naming decisions: [DATA_SOURCES.md](DATA_SOURCES.md).
 
 Goal: remove the USB bridge. The Wemos S2 mini fetches its frame from the NStupido server over WiFi. The server tracks the stops that clients actually ask for, keeps everything except the timetable cache in memory, and never polls nsmart.rs faster than a fixed rate.
 
@@ -170,3 +170,19 @@ Deviations / decisions:
 - **USB bridge:** still supported by the v4 firmware (serial frames are drawn, WiFi fetch pauses 30 s, BOOT sends `BTN`).
 - **Stop names:** `stations_cache.json` (getAllStations, weekly) is still written to disk; it is a name dictionary, not state.
 - Removed: `state.json`, `--state/--no-state/--interval/--log-snapshots`, `?schedule=` on the server.
+
+## 11. v4.1: any stop gets its full timetable (11 Oct 2026)
+
+Plan items 2.1 step 3 and 2.5 step 4 ("fetch the GSPNS timetable for any routes not yet cached") are now fully automatic. Details and evidence: [DATA_SOURCES.md](DATA_SOURCES.md).
+
+- **Lines of a stop** come from the nsmart station list (`lines_for_station`). This needs no live bus, so the list is complete on the first request.
+- **Direction and variants** come from the gspns network map. The map stop is matched by coordinates plus shared routes (6712 and 15889 share coordinates). Its labels (`1GLA`, `14SB`, `3AA`) give route + variant + direction. The timetable column is chosen by destination, then by letter.
+- **Marks:** every departure counts, including school and factory trips, unless the map shows that its variant serves other stops. Unknown marks are included.
+- **Missing timetables** are fetched immediately (paced 1–2 s, same gspns lock as the 05:00 refresh); the stop answers `"warming": true` until they are in (~15 s). A failure retries after 15 min.
+- **Routes seen live but unknown:** direction from `actual_line_number` (trailing `B`), timetable fetched at once.
+- **05:00 refresh** covers all watched stops (default + dynamic); the disk cache serves restarts mid-day.
+- **Reference caches** (station list, network map): refreshed if older than 14 days, 1 h after start and checked daily at 05:10; a failure keeps the old cache.
+- **Display:** base route only (`14S` → `14`); letters only for distinct routes (`3A`, `3B`, `5N`, `6A`, `7A/7B`, `11A/11B`, `18A/18B`); variants share one row.
+- **Default stops** keep the hand-made `STOP_LINES` as an override. The derivation reproduces them, with one weekday `55 KN` trip less at 15889, and it exposed a manual bug: line 77 on Sundays has only direction B; manual entries now carry a direction letter.
+- **No access log:** each client's first request is logged once, and `http:` status counts every 30 min (and in `GET /`).
+- New module `routes.py`; tests `tests/test_routes.py`; comparison tool `tools/compare_lines.py`.

@@ -9,6 +9,7 @@ rv: rvg (gradski / urban) | rvp (prigradski / suburban); dan: R weekday, S Satur
 Stdlib only.
 """
 import os, re, json, time, html, threading, urllib.request, urllib.parse
+import routes
 from datetime import date, datetime, timedelta
 from rs_holidays import rs_holidays
 
@@ -56,7 +57,7 @@ for _l in ["52", "53", "54", "55", "60", "61", "62", "63", "64", "68", "69", "71
     _names = {None: _l}
     for _m, _n in _SUB_NAMES.get(_l, {}).items():
         _names[_m] = _n
-    STOP_LINES["15889"].append({"base": _l, "rv": "rvp", "dir": 0, "names": _names, "all_marks": True,
+    STOP_LINES["15889"].append({"base": _l, "rv": "rvp", "dir": 0, "letter": "A", "names": _names, "all_marks": True,
                                 "tt": {_l: _SUB_TT.get(_l, 2), **{n: (4 if n == "72IS" else _SUB_TT.get(_l, 2)) for n in _names.values()}}})
 DEFAULT_TT_MIN = 2
 
@@ -70,10 +71,10 @@ def needed_lines(stops=None):
             out.setdefault(c["rv"], set()).add(c["base"])
     return out
 
-def base_of(line, stop):
+def base_of(line, stop, entries=None):
     """nsmart line name -> configured gspns base line for this stop (longest prefix), or None."""
     best = None
-    for c in STOP_LINES.get(stop, []):
+    for c in (STOP_LINES.get(stop, []) if entries is None else entries):
         b = c["base"]
         if line == b or (line.startswith(b) and not line[len(b):len(b) + 1].isdigit()):
             if best is None or len(b) > len(best):
@@ -158,10 +159,15 @@ def _get(path, params=None, opener=None):
 class Timetables:
     """Thread-safe holder of the gspns index (day type per date, validity dates) and cached timetables."""
 
-    def __init__(self, cache_dir=CACHE_DIR, fetch=None, pause=None):
+    def __init__(self, cache_dir=CACHE_DIR, fetch=None, pause=None, resolver=None, pace_window=2.5):
         self.cache_dir = cache_dir
         self._raw_fetch = fetch or _get        # injectable for tests: fetch(path, params) -> html
         self.pause = pause                     # called between two gspns requests (polite pacing), or None
+        self.pace_window = pace_window         # ... unless the previous request is older than this (s)
+        self.net_lock = threading.RLock()      # one gspns request at a time, whoever asks (refresh, new stop, map)
+        self._last_req = 0.0
+        # stop -> line entries (static STOP_LINES by default; the server plugs in routes.Resolver)
+        self.resolver = resolver or (lambda stop: STOP_LINES.get(stop, []))
         self._requests = 0
         self.last_result = None                # {"at", "ok", "fetched", "failed"} of the last refresh
         self.lock = threading.RLock()
@@ -171,10 +177,96 @@ class Timetables:
         self._load()
 
     def fetch(self, path, params=None):
-        if self.pause and self._requests:
-            self.pause()
-        self._requests += 1
-        return self._raw_fetch(path, params)
+        """Every gspns request (timetables and the network map) goes through here: serialised, 1-2 s apart."""
+        with self.net_lock:
+            if self.pause and self._requests and time.monotonic() - self._last_req < self.pace_window:
+                self.pause()
+            self._requests += 1
+            try:
+                return self._raw_fetch(path, params)
+            finally:
+                self._last_req = time.monotonic()
+
+    # -- which lines --
+    def entries(self, stop):
+        return self.resolver(stop) or []
+
+    def needed(self, stops=None):
+        """{rv: {base lines}} for `stops` (None: the static STOP_LINES stops)."""
+        if stops is None:
+            return needed_lines()
+        out = {}
+        for uid in stops:
+            for c in self.entries(uid):
+                out.setdefault(c["rv"], set()).add(c["base"])
+        return out
+
+    def base_of(self, line, stop):
+        return base_of(line, stop, self.entries(stop))
+
+    def known_bases(self):
+        """Distinct gspns routes = line options (without '.'/'*') ever listed, per rv."""
+        with self.lock:
+            opts = self.index.get("options") or {}
+        out = {}
+        for rv, by_dan in opts.items():
+            for lst in by_dan.values():
+                out.update({o.rstrip(".*"): rv for o in lst})
+        return out
+
+    def missing(self, stops):
+        """{rv: {bases}} needed by `stops` but never requested for the current validity date(s)."""
+        need = self.needed(stops)
+        with self.lock:
+            vs = list(self.index.get("vaziod") or sorted(self.data))
+            req = {v: (self.data.get(v) or {}).get("requested") for v in vs}
+        out = {}
+        for rv, bases in need.items():
+            for v in vs:
+                r = req.get(v)
+                have = set((r or {}).get(rv, [])) if r is not None else self._have(v, rv)
+                for b in bases - have:
+                    out.setdefault(rv, set()).add(b)
+        return out
+
+    def _have(self, v, rv):
+        with self.lock:
+            lines = (self.data.get(v) or {}).get("lines", {}).get(rv, {})
+        return {b for d in lines.values() for b in d}
+
+    def ensure(self, stops, today=None):
+        """Fetch timetables of lines needed by `stops` that were never requested (a new stop, a route first seen
+        live). Uses the cached validity dates; -> (fetched_requests, failed_requests)."""
+        miss = self.missing(stops)
+        if not miss:
+            return 0, 0
+        with self.lock:
+            vs = list(self.index.get("vaziod") or [])
+        if not vs:
+            if not self.refresh(today=today, stops=stops):
+                return 0, 1
+            return 1, 0
+        ok = bad = 0
+        for v in vs:
+            with self.lock:
+                old = (self.data.get(v) or {}).get("lines") or {}
+            lines, o, b = self._fetch_timetable(v, need=miss, old=old)
+            ok, bad = ok + o, bad + b
+            with self.lock:
+                obj = dict(self.data.get(v) or {"vaziod": v, "fetched": time.time()})
+                obj["lines"] = lines
+                if b == 0:
+                    req = {rv: set(x) for rv, x in (obj.get("requested") or self._requested_from(old)).items()}
+                    for rv, bases in miss.items():
+                        req.setdefault(rv, set()).update(bases)
+                    obj["requested"] = {rv: sorted(x) for rv, x in req.items()}
+                self.data[v] = obj
+                self._save("timetable_%s.json" % v, obj)
+        return ok, bad
+
+    @staticmethod
+    def _requested_from(lines):
+        return {rv: {b for d in by.values() for b in d} for rv, by in (lines or {}).items()}
 
     # -- cache files --
     def _path(self, name):
@@ -235,12 +327,20 @@ class Timetables:
         for v in todo:
             with self.lock:
                 old = (self.data.get(v) or {}).get("lines") or {}
-            lines, ok, bad = self._fetch_timetable(v, stops=stops, old=old)
+            need = self.needed(stops)
+            lines, ok, bad = self._fetch_timetable(v, need=need, old=old)
             fetched, failed = fetched + ok, failed + bad
             if not any(lines.get(rv, {}).get(d) for rv in lines for d in DAY_TYPES):
                 self.last_error = "timetable %s: empty" % v
                 continue
-            obj = {"vaziod": v, "fetched": time.time(), "lines": lines}
+            with self.lock:
+                prev_req = (self.data.get(v) or {}).get("requested") or self._requested_from(old)
+            req = {rv: set(x) for rv, x in prev_req.items()}
+            if bad == 0:
+                for rv, bases in need.items():
+                    req.setdefault(rv, set()).update(bases)
+            obj = {"vaziod": v, "fetched": time.time(), "lines": lines,
+                   "requested": {rv: sorted(x) for rv, x in req.items()}}
             with self.lock:
                 self.data[v] = obj
                 self._save("timetable_%s.json" % v, obj)
@@ -252,14 +352,18 @@ class Timetables:
         self.last_result = {"at": time.time(), "ok": ok, "fetched": fetched, "failed": failed}
         return ok
 
-    def _fetch_timetable(self, vaziod, stops=None, old=None):
+    def _fetch_timetable(self, vaziod, need=None, old=None):
         """-> (lines, ok_count, failed_count); a failed (rv, day type) keeps its copy from `old`."""
         lines, ok, bad = {}, 0, 0
         old = old or {}
-        for rv, bases in needed_lines(stops).items():
+        for rv in old:                                   # keep every rv already cached
+            lines[rv] = {d: dict(t) for d, t in old[rv].items()}
+        for rv, bases in (needed_lines() if need is None else need).items():
             for dan in DAY_TYPES:
                 try:
                     opts = parse_line_options(self.fetch("/red-voznje/lista-linija", {"rv": rv, "vaziod": vaziod, "dan": dan}))
+                    with self.lock:
+                        self.index.setdefault("options", {}).setdefault(rv, {})[dan] = opts
                     want = [o for o in opts if o.rstrip(".*") in bases]
                     tables = parse_timetables(self.fetch("/red-voznje/ispis-polazaka",
                                                          {"rv": rv, "vaziod": vaziod, "dan": dan, "linija[]": want})) if want else {}
@@ -270,6 +374,9 @@ class Timetables:
                     bad += 1
                 prev = old.get(rv, {}).get(dan, {})
                 lines.setdefault(rv, {})[dan] = {**prev, **tables}   # lines of stops not refreshed now stay
+        if ok:
+            with self.lock:
+                self._save("index.json", self.index)
         return lines, ok, bad
 
     def refreshed_at(self):
@@ -313,23 +420,39 @@ class Timetables:
         with self.lock:
             lines = self.data[v]["lines"]
         out = []
-        for c in STOP_LINES.get(stop, []):
+        for c in self.entries(stop):
             t = lines.get(c["rv"], {}).get(dt_, {}).get(c["base"])
-            if not t or c["dir"] >= len(t["directions"]):
+            if not t:
                 continue
-            d = t["directions"][c["dir"]]
+            if c.get("dir") is not None:
+                col = c["dir"]
+                # a manual entry may name its direction letter: guards tables that lack a column on some days
+                # (77 on Sundays has only "Smer B", so index 0 would be the wrong direction)
+                if c.get("letter") and col < len(t["directions"]) and \
+                        routes.header_letter(t["directions"][col]["header"]) not in (None, c["letter"]):
+                    col = next((i for i, d in enumerate(t["directions"])
+                                if routes.header_letter(d["header"]) == c["letter"]), None)
+            else:
+                col = routes.choose_column(t["directions"], c.get("letter"), c.get("title"))
+            if col is None or col >= len(t["directions"]):
+                continue
+            d = t["directions"][col]
             for off, hh, mm, mark in expand_departures(d["departures"]):
-                if mark in c["names"]:
+                if "allow" in c:                       # derived entry: map variant rules
+                    if not c["allow"](mark):
+                        continue
+                    name = c["name_of"](mark)
+                elif mark in c["names"]:
                     name = c["names"][mark]
                 elif c.get("all_marks"):
                     name = c["names"][None]
                 else:
                     continue
                 dep = datetime.combine(service_day + timedelta(days=off), datetime.min.time()).replace(hour=hh, minute=mm)
-                out.append({"stop": stop, "base": c["base"], "dir": c["dir"], "mark": mark, "line": name,
+                out.append({"stop": stop, "base": c["base"], "dir": col, "mark": mark, "line": name,
                             "dep": dep, "header": d["header"], "day_type": dt_, "vaziod": v,
-                            "tt": c["tt"].get(name, c["tt"].get(c["base"])),
-                            "trip_id": "%s|%s|%d|%s" % (stop, c["base"], c["dir"], dep.strftime("%Y-%m-%dT%H:%M"))})
+                            "tt": c["tt"].get(name, c["tt"].get(c["base"])), "source": c.get("source", "manual"),
+                            "trip_id": "%s|%s|%d|%s" % (stop, c["base"], col, dep.strftime("%Y-%m-%dT%H:%M"))})
         return out
 
     def window(self, stop, now_dt, back=timedelta(hours=3), ahead=timedelta(hours=2)):
