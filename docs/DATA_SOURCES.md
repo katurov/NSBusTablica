@@ -138,3 +138,15 @@ E
 ```
 
 - 3A doesn't run on Sundays and 18A is a night line, so both are correctly absent. `1GL` trips are shown as `1`.
+
+## 8. Access control (v4.2), and why
+
+The server moved to its own host behind `nstupido.teamof.top:8080`, which may be reachable from outside the home network. Each request is now checked:
+
+- **LAN trust without tokens:** the board and home devices sit in `192.168.42.0/24` (plus localhost). The ESP32 firmware has no secret storage worth the name, re-flashing it for a token gains nothing on a home LAN, and the board must keep working untouched. IPv4-mapped IPv6 addresses (`::ffff:192.168.42.x`, from dual-stack sockets) are unwrapped first, so the LAN check can't be bypassed or missed that way.
+- **Named tokens for everyone else:** Paul hands one token per friend or device (10 slots in the template). The name shows up in the logs (first use, 12 h usage counts), so a leaked token can be found and removed without touching the others. Compared in constant time; never logged.
+- **Untracked `auth.toml`:** the server deploys by `git pull`. Tokens in a tracked file would either be public in the repo or produce merge conflicts and overwrites on every pull. So `config.toml` holds only the non-secret `[auth]` settings, and `auth.toml` (git-ignored) holds the tokens and may override any `[auth]` key. The tracked `auth.example.toml` has `CHANGE-ME` placeholders, which the server refuses, so copying the template unedited can't create a valid token.
+- **Secure default:** with no usable token, outside requests are all refused. A missing or unedited `auth.toml` therefore means "LAN only", never "open".
+- **No `X-Forwarded-For` by default:** the header is client-controlled. It is believed only from configured `trusted_proxies`, taking the right-most hop that isn't a proxy.
+- **Quiet logs:** rejected requests (scanners) are only counted and summarised at most every 30 min, the same pattern as the nsmart error log, so syslog isn't flooded.
+- **Minimal 401:** a bare `unauthorized` body with `WWW-Authenticate: Bearer` tells a scanner nothing about the stops, the queue or the software version beyond the server header. The per-client list in `GET /` (addresses) is shown only to trusted networks.

@@ -129,6 +129,13 @@ curl -sS 'http://gspns.rs/red-voznje/ispis-polazaka?rv=rvg&vaziod=2026-10-01&dan
 5. Offline comparison of the automatic derivation with the hand-made `STOP_LINES` (no requests): `python3 tools/compare_lines.py [--date 2026-10-12] [6539 6712 15889]`. Expected today: identical for 6539 and 6712; 15889 differs by one `55 KN` weekday trip (see docs/DATA_SOURCES.md).
 6. Reference caches: `GET /debug` → `reference.stations_fetched` / `map_fetched` (epoch s); start log line `reference caches: station list 5.1 days old, network map 5.1 days old …`. They refresh 1 h after start only if older than 14 days.
 
+## 7b. Access Control (v4.2)
+
+- From the LAN / server: `curl -s -o /dev/null -w "%{http_code}\n" "http://nstupido.teamof.top:8080/frame?stop=6539"` → `200` without a token.
+- From outside (mobile data): the same → `401`; with `-H "Authorization: Bearer <token>"` → `200`.
+- Startup log: `auth file …/auth.toml: loaded`, `auth: trusted networks …; N token(s) active`, and a warning per refused (`CHANGE-ME`, short) token. `auth: no usable tokens - … all rejected` means outside access is off.
+- Every 30 min, only if something was rejected: `unauthorized: N requests in last 30 min from M address(es)`.
+
 ## 8. Agent Success Checklist
 
 - [ ] `python3 -c "import nstupido, timetable, routes, rs_holidays"` without errors

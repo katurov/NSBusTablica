@@ -186,3 +186,7 @@ Plan items 2.1 step 3 and 2.5 step 4 ("fetch the GSPNS timetable for any routes 
 - **Default stops** keep the hand-made `STOP_LINES` as an override. The derivation reproduces them, with one weekday `55 KN` trip less at 15889, and it exposed a manual bug: line 77 on Sundays has only direction B; manual entries now carry a direction letter.
 - **No access log:** each client's first request is logged once, and `http:` status counts every 30 min (and in `GET /`).
 - New module `routes.py`; tests `tests/test_routes.py`; comparison tool `tools/compare_lines.py`.
+
+## 12. v4.2: access control (11 Oct 2026)
+
+Trusted networks (LAN, localhost) need no token; everyone else needs a named token in `Authorization: Bearer`, `X-Token` or `?token=`, otherwise a bare `401`. Tokens live in the untracked `auth.toml` (template `auth.example.toml`), so `git pull` deployments never touch them. Rationale: [DATA_SOURCES.md §8](DATA_SOURCES.md#8-access-control-v42-and-why); usage: README "Access / tokens". The board needs no change.

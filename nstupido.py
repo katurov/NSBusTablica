@@ -10,8 +10,8 @@ Server:  python3 nstupido.py --serve [--config config.toml] [--host 0.0.0.0] [--
          GET /buses?stop=6551       -> JSON for that stop (comma-separated list allowed, &merge=1)
          GET /frame?stop=6551       -> text frame for the board (H|stop|HH:MM|flags, R|line|G:3|P:20, E)
          GET /debug                 -> timetable status, feeders, learned travel times, recent arrivals
-         Codes: 200 (maybe "warming": true / "live": false), 400 bad uid, 404 no such stop in nsmart,
-                429 queue full (Retry-After), 503 starting (Retry-After).
+         Codes: 200 (maybe "warming": true / "live": false), 400 bad uid, 401 outside the trusted networks without
+                a valid token (auth.py), 404 no such stop in nsmart, 429 queue full (Retry-After), 503 starting.
 
 Everything except the reference caches (cache/gspns/ timetables + network map, cache/nsmart/ station list) lives in
 memory. nsmart is polled by one queue:
@@ -33,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import timetable                                   # noqa: E402  (vendored, same directory)
 import routes                                      # noqa: E402
+import auth                                        # noqa: E402
 
 API_URL = "https://online.nsmart.rs/sr/najava-dolaska/"
 DEFAULT_STOPS = [
@@ -609,6 +610,7 @@ DEFAULT_CONFIG = {
     "timetable": {"refresh_at": "05:00", "pause_s": [1, 2], "retry_min": 15, "retries": 3},
     "reference": {"max_age_days": 14, "start_delay_min": 60},
     "logging": {"stats_every_h": 12, "errors_every_min": 30},
+    "auth": json.loads(json.dumps(auth.DEFAULT_AUTH)),
 }
 
 
@@ -628,8 +630,16 @@ def _mini_toml(text):
         k, sep, v = line.partition("=")
         if not sep:
             raise ValueError("bad config line: %r" % raw)
-        v = re.sub(r"'([^']*)'", lambda mm: json.dumps(mm.group(1)), v.strip())
-        (cur if cur is not None else out)[k.strip().strip('"')] = json.loads(v)
+        v = v.strip()
+        if v.startswith("{"):                            # inline table of strings: { name = "token", ... }
+            if not v.endswith("}"):
+                raise ValueError("bad inline table: %r" % raw)
+            val = {}
+            for kk, vv in re.findall(r"""([A-Za-z0-9_-]+|"[^"]*")\s*=\s*("[^"]*"|'[^']*')""", v[1:-1]):
+                val[kk.strip('"')] = vv[1:-1]
+        else:
+            val = json.loads(re.sub(r"'([^']*)'", lambda mm: json.dumps(mm.group(1)), v))
+        (cur if cur is not None else out)[k.strip().strip('"')] = val
     return out
 
 
@@ -656,8 +666,29 @@ def load_config(path=None):
         for sec, vals in data.items():
             if isinstance(vals, dict):
                 cfg.setdefault(sec, {}).update(vals)
+    merge_auth_file(cfg, os.path.dirname(os.path.abspath(path)))
     cfg["stops"]["default"] = [str(x) for x in cfg["stops"]["default"]]
     return cfg
+
+
+def merge_auth_file(cfg, base_dir):
+    """Overlay the untracked auth file (default auth.toml next to config.toml): its [auth] keys win, tokens from
+    [auth.tokens], `[auth] tokens = {...}` or a top-level [tokens] table are added. Missing file = nothing."""
+    a = cfg.setdefault("auth", {})
+    a["tokens"] = dict(a.get("tokens") or {})
+    fn = a.get("file") or "auth.toml"
+    path = fn if os.path.isabs(fn) else os.path.join(base_dir, fn)
+    a["file_path"], a["file_loaded"] = path, False
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        data = parse_toml(f.read())
+    extra = dict(data.get("auth") or {})
+    tokens = dict(extra.pop("tokens", None) or {})
+    tokens.update(data.get("tokens") or {})
+    a.update(extra)
+    a["tokens"].update({str(k): v for k, v in tokens.items()})
+    a["file_loaded"] = True
 
 
 # ---------------- logging (syslog: facility daemon, ident nstupido) ----------------
@@ -993,6 +1024,7 @@ class Service:
         self.urgent = collections.deque()
         self.errors = ErrorLog(cfg["logging"]["errors_every_min"] * 60, clock)
         self.clients = Clients(cfg["logging"]["stats_every_h"] * 3600, clock)
+        self.auth = auth.Auth(cfg.get("auth"), clock)
         self.ready = threading.Event()
         self.stopping = threading.Event()
         self.lock = threading.RLock()
@@ -1248,7 +1280,7 @@ class Service:
     # -- logging --
     def record_http(self, ip, path, status):
         """No access log (the board asks every 5 s): count (path, status), log a client's first request once."""
-        p = urllib.parse.urlparse(path or "")
+        p = urllib.parse.urlparse(auth.redact(path))
         key = "%s %d" % (p.path or "/", status)
         with self.lock:
             if not hasattr(self, "http"):
@@ -1273,14 +1305,18 @@ class Service:
         st = self.watch.stops()
         nd = len(self.watch.defaults)
         return "stats: %d stops watched (%d default, %d dynamic), queue %d requests/cycle (interval %.1f s, limit %d), " \
-               "%d clients in last %g h" % (len(st), nd, len(st) - nd, self.queue_length(), self.interval(), self.cap,
-                                            self.clients.count(), self.cfg["logging"]["stats_every_h"])
+               "%d clients in last %g h, %s" % (len(st), nd, len(st) - nd, self.queue_length(), self.interval(), self.cap,
+                                                self.clients.count(), self.cfg["logging"]["stats_every_h"],
+                                                self.auth.usage_line())
 
     def housekeeping_forever(self):
         every = self.cfg["logging"]["stats_every_h"] * 3600
         last_stats = self.clock()
         while not self.stopping.wait(30):
             line = self.errors.flush(self.gate.backoff_s())
+            if line:
+                LOG.info(line)
+            line = self.auth.flush_denied(self.cfg["logging"]["errors_every_min"] * 60)
             if line:
                 LOG.info(line)
             if self.clock() - getattr(self, "_http_at", 0) >= self.cfg["logging"]["errors_every_min"] * 60:
@@ -1293,7 +1329,14 @@ class Service:
                 last_stats = self.clock()
                 LOG.info(self.stats_line())
 
-    def status(self):
+    def status(self, trusted=True):
+        """Service overview; the per-client list (addresses) only for trusted networks."""
+        out = self._status()
+        if not trusted:
+            out.pop("clients", None)
+        return out
+
+    def _status(self):
         tz = local_tz(self.cfg["server"]["timezone"])
         return {"usage": {"GET /buses?stop=<uid>": "JSON arrivals (G/E/P), stops comma-separated, &merge=1",
                           "GET /frame?stop=<uid>": "text frame for the OLED board (H/R/E lines)",
@@ -1348,7 +1391,7 @@ SERVICE = None                                  # set by serve()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NStupido/4.1"
+    server_version = "NStupido/4.2"
     service = None                              # tests may set a class attribute; default: SERVICE
 
     @property
@@ -1357,7 +1400,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, status, obj, headers=None, text=None):
         try:
-            self.svc.record_http(self._client_ip(), self.path, status)
+            if status != 401:                       # rejected requests are only counted (Auth.flush_denied)
+                self.svc.record_http(str(self._client_ip()), self.path, status)
         except Exception:
             pass
         body = (text if text is not None else dumps(obj)).encode("utf-8")
@@ -1380,8 +1424,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _client_ip(self):
-        xff = self.headers.get("X-Forwarded-For")
-        return xff.split(",")[0].strip() if xff else self.client_address[0]
+        """Peer address (IPv4-mapped IPv6 unwrapped); X-Forwarded-For only via [auth] trusted_proxies."""
+        ip = self.svc.auth.client_ip(self.client_address[0], self.headers.get("X-Forwarded-For"))
+        return ip if ip is not None else self.client_address[0]
+
+    def _authorize(self, q):
+        """-> True if the request may proceed (trusted network or valid token); else a bare 401 was sent."""
+        ip = self._client_ip()
+        kind, name = self.svc.auth.check(ip if not isinstance(ip, str) else auth.parse_ip(ip), self.headers, q)
+        self._trusted = kind == "trusted"
+        if kind == "denied":
+            body = b"unauthorized\n"
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", "Bearer")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return False
+        if kind == "token-first":
+            LOG.info("token %s first request from %s: %s", name, ip, auth.redact(self.path))
+        return True
 
     def resolve(self, q):
         """-> (status, obj, headers, views) for /buses and /frame."""
@@ -1405,9 +1470,11 @@ class Handler(BaseHTTPRequestHandler):
         p = u.path.rstrip("/")
         q = urllib.parse.parse_qs(u.query)
         svc = self.svc
-        svc.clients.hit(self._client_ip())
+        if not self._authorize(q):
+            return
+        svc.clients.hit(str(self._client_ip()))
         if p == "":
-            return self._send(200, svc.status())
+            return self._send(200, svc.status(trusted=self._trusted))
         if p == "/debug":
             mem = svc.mem
             with mem.lock:
@@ -1480,6 +1547,10 @@ def serve(cfg, host, port, use_schedule=True, use_feeders=True):
     signal.signal(signal.SIGTERM, _term)
     LOG.info("start: listening on %s:%d, default stops %s, cycle %gs, min interval %gs, limit %d requests/cycle",
              host, port, ",".join(svc.watch.defaults), svc.cycle_s, svc.min_interval_s, svc.cap)
+    a = cfg.get("auth") or {}
+    LOG.info("auth file %s: %s", a.get("file_path"), "loaded" if a.get("file_loaded") else "not found")
+    for line in svc.auth.startup_lines():
+        LOG.info(line)
     if tt is not None:
         if tt.data:
             svc.ready.set()                      # a cached (maybe stale) timetable is good enough to answer

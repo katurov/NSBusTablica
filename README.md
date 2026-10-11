@@ -8,6 +8,7 @@ Home display for upcoming buses in GSP Novi Sad: live nsmart data + memory betwe
 - **Board** connects to WiFi and fetches `GET <SERVER_URL>/frame?stop=<uid>` every 5 s; BOOT button cycles the compiled stop list; more than 4 routes → pages.
 - **USB bridge** (`oled_bridge.py`) is legacy/optional: the v4 firmware still draws frames arriving over USB serial.
 - **v4.1 – any stop:** ask for any nsmart stop and, after ~15 s of `"warming"`, get the full list: live buses (G/E) plus the official timetable (P) of *every* line through that stop. Lines come from the nsmart station list, their direction from the gspns network map, missing timetables are downloaded on the spot (paced). The board shows the **base route** only (`14S` → `14`, `1GL` → `1`); letters stay only where they name a different route (`3A`, `7B`, `18A`).
+- **v4.2 – access control:** LAN (`192.168.42.0/24`) and localhost need nothing; other clients need a named token (`Authorization: Bearer …`) from the untracked `auth.toml`, otherwise `401`. See [Access / tokens](#access--tokens).
 
 Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md). Data sources, the route naming model and *why* things are done this way: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**.
 
@@ -19,6 +20,8 @@ Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md). Data sources, th
 | `config.toml` | Server config: default stops, host/port, polling limits, timetable refresh, logging |
 | `nstupido-server.sh` | Start/stop the server detached (`start`/`stop`/`restart`/`status`) |
 | `timetable.py` | Load/cache gspns.rs, day type, hand-made `STOP_LINES` (default stops), scheduled departures, on-demand fetch of missing lines |
+| `auth.py` | API access: trusted networks, named tokens, proxy handling, 401 aggregation |
+| `auth.example.toml` | Template for the untracked `auth.toml` (10 `CHANGE-ME` placeholders, refused as tokens) |
 | `routes.py` | Route naming (base / variant / direction), nsmart station list + gspns network map caches, stop → lines derivation, live learning |
 | `tools/compare_lines.py` | Offline check: automatic stop → lines derivation vs hand-made `STOP_LINES`, departure by departure |
 | `rs_holidays.py` | Republic of Serbia holidays (incl. Orthodox Easter) for fallback day type |
@@ -31,6 +34,7 @@ Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md). Data sources, th
 | `HOW_TO_TEST_DATA.md` | Agent playbook: how to verify data is coming through |
 | `requirements.txt` | Optional deps (`pyserial` for the bridge, `tomli` on Python < 3.11 optional) |
 | `cache/gspns/` | **runtime**: timetables + index (`timetable_<vaziod>.json`, `index.json`), network map (`map.json`) |
+| `auth.toml` | **untracked, git-ignored**: real API tokens on the server (copy of `auth.example.toml`) |
 | `cache/nsmart/stations.json` | **runtime**: nsmart station list (names, coordinates, lines per stop) |
 | `nstupido.log`, `nstupido.pid` | **runtime**: server log / PID when started with `nstupido-server.sh` |
 
@@ -76,7 +80,8 @@ Any other stop: just ask for it (`/buses?stop=<uid>`, `/frame?stop=<uid>`, or ad
 
 ```bash
 git clone https://github.com/katurov/NSBusTablica.git NStupido && cd NStupido
-# edit config.toml if needed (default stops, port)
+# edit config.toml if needed (default stops, port); tokens for outside clients:
+cp auth.example.toml auth.toml && chmod 600 auth.toml   # then replace every CHANGE-ME-xx with a real token
 ./nstupido-server.sh start            # detached; PYTHON=/opt/homebrew/bin/python3.10 ./nstupido-server.sh start on the Mac
 ./nstupido-server.sh status
 curl -s http://nstupido.teamof.top:8080/ ; curl -s "http://nstupido.teamof.top:8080/frame?stop=6539"
@@ -84,6 +89,33 @@ curl -s http://nstupido.teamof.top:8080/ ; curl -s "http://nstupido.teamof.top:8
 ```
 
 Foreground (debug): `python3 nstupido.py --serve` (`--port`, `--host`, `--config` override `config.toml`). The macOS firewall must allow incoming connections for the Python binary. For port 80 put a reverse proxy in front (or set `port = 80` where the OS allows it) and change the board's `SERVER_URL`.
+
+### Access / tokens
+
+The server may be reachable from outside the LAN (`nstupido.teamof.top`), so v4.2 checks every request:
+
+- **Trusted networks** need nothing: `[auth] trusted_networks`, default `127.0.0.0/8`, `::1`, `192.168.42.0/24`. IPv4-mapped IPv6 peers (`::ffff:192.168.42.x`, dual-stack sockets) count as their IPv4 address. The board on the LAN keeps working without changes.
+- **Everyone else** needs a named token, sent in one of three ways: `Authorization: Bearer <token>` (preferred), `X-Token: <token>`, or `?token=<token>` (handy for a browser; it ends up in browser history and proxy logs, so use the header where possible). Without a valid token the server answers `401` with `WWW-Authenticate: Bearer` and the body `unauthorized`, nothing more.
+- **Tokens live in `auth.toml`**, an untracked and git-ignored file next to `config.toml`. The server pulls code from git, so a tracked file with Paul's tokens would be overwritten or conflict on every pull, and secrets don't belong in a public repo anyway. Template: `auth.example.toml`. Any `[auth]` key can also be set in `auth.toml` (it wins over `config.toml`).
+  ```toml
+  [auth.tokens]
+  friend01 = "y3n...32 random characters..."
+  phone    = "..."
+  ```
+  `tokens = { friend01 = "…", phone = "…" }` under `[auth]`, or a top-level `[tokens]` table, work too, also on Python 3.10 (built-in parser).
+- **Refused tokens:** values starting with `CHANGE-ME`, empty values and values shorter than 16 characters. Each is listed at startup as `auth: WARNING token friend02 ignored: placeholder`. **With no usable token, every request from outside is rejected** (secure default): forgetting `auth.toml` never opens the server.
+- `[auth] enabled = false` turns checking off entirely (logged at startup; only for closed networks).
+- Tokens are compared in constant time (`hmac.compare_digest`) and never logged; `?token=` is removed from logged paths.
+- **`X-Forwarded-For`** is ignored unless the direct peer is in `[auth] trusted_proxies` (e.g. `["127.0.0.1/32"]` behind a local nginx). Then the right-most forwarded address that is not itself a proxy is the client. Otherwise anyone could claim to be on the LAN.
+- `GET /` shows the per-client list (addresses, last request) only to trusted networks. Token clients get the rest.
+- Logs: `token friend01 first request from 1.2.3.4: /frame?stop=6539` (once per token name per run); rejected requests are never logged one by one, only `unauthorized: 37 requests in last 30 min from 3 address(es)` at most every 30 min and only if there were any; the 12 h `stats:` line ends with `requests by token: friend01 120, phone 7`.
+
+Use from outside:
+
+```bash
+curl -H "Authorization: Bearer <token>" "http://nstupido.teamof.top:8080/frame?stop=6539"
+curl "http://nstupido.teamof.top:8080/buses?stop=6660&token=<token>"
+```
 
 ### Behaviour
 
@@ -109,6 +141,7 @@ Foreground (debug): `python3 nstupido.py --serve` (`--port`, `--host`, `--config
 |---|---|
 | `200` | data (maybe `"warming": true` or `"live": false`) |
 | `400` | malformed uid (must be 1–7 digits) |
+| `401` | outside the trusted networks without a valid token (`WWW-Authenticate: Bearer`, body `unauthorized`) |
 | `404` | stop does not exist in nsmart |
 | `429` | queue full: `Retry-After: 600`, `{"error": "stop limit reached", "limit": 100}` |
 | `503` | starting, no timetable yet: `Retry-After: 10` (only on a first start without cache) |
@@ -139,6 +172,10 @@ Errors on `/frame` come as `ERR|<code>|<message>` with the same HTTP codes.
 | `timetable.refresh_at` | `"05:00"` | daily gspns refresh (local) |
 | `timetable.pause_s` | `[1, 2]` | random pause between gspns requests |
 | `timetable.retry_min` / `retries` | 15 / 3 | retry after a failed refresh (also: failed timetable fetch for a new stop) |
+| `auth.enabled` | `true` | `false` = no access control |
+| `auth.trusted_networks` | `["127.0.0.0/8", "::1/128", "192.168.42.0/24"]` | no token needed |
+| `auth.trusted_proxies` | `[]` | peers whose `X-Forwarded-For` is believed |
+| `auth.file` | `"auth.toml"` | untracked token file (relative to `config.toml`), overrides `[auth]` |
 | `reference.max_age_days` | 14 | station list / network map older than this are refreshed … |
 | `reference.start_delay_min` | 60 | … this long after start, then checked daily at `refresh_at` + 10 min |
 | `logging.stats_every_h` / `errors_every_min` | 12 / 30 | syslog cadence |
@@ -192,6 +229,7 @@ python3 -m unittest discover -s tests -v          # offline + live
 python3 -m unittest tests.test_server -v          # v4 server: queue math, groups, capacity/429, TTL, backoff,
                                                   # log aggregation, HTTP codes, timetable refresh schedule
 python3 -m unittest tests.test_schedule -v        # schedule, matching, feeders
+python3 -m unittest tests.test_auth -v            # v4.2: trusted networks, tokens, CHANGE-ME, mapped IPv6, proxies, 401 log
 python3 -m unittest tests.test_routes -v          # v4.1: route names, map matching, mark rules, cache age rules,
                                                   # new-stop flow, unknown live route, HTTP counters
 python3 -m unittest tests.test_bridge -v          # legacy bridge: stop cycling, serial input, paging

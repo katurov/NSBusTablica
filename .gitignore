@@ -31,3 +31,7 @@ local*.ini
 # Firmware secrets (WiFi credentials)
 firmware/secrets.ini
 *.pid
+
+# API tokens (untracked; template: auth.example.toml)
+auth.toml
+secrets.toml

@@ -26,6 +26,14 @@ retries = 3               # ... up to 3 times
 max_age_days = 14         # refresh a cache older than this (or missing) ...
 start_delay_min = 60      # ... 60 min after server start, and re-check daily at refresh_at (+10 min)
 
+[auth]                    # who may use the HTTP API (see README "Access / tokens")
+enabled = true            # false = everyone is accepted (not recommended outside a LAN)
+trusted_networks = ["127.0.0.0/8", "::1/128", "192.168.42.0/24"]   # no token needed (IPv4-mapped IPv6 counts too)
+trusted_proxies = []      # X-Forwarded-For is believed only from these (e.g. ["127.0.0.1/32"] behind a local proxy)
+file = "auth.toml"        # untracked (git-ignored) token file next to this one; copy auth.example.toml
+# Tokens never go here (tracked file): put them in auth.toml as [auth.tokens] name = "token".
+# No usable token = every request from outside trusted_networks gets 401.
+
 [logging]
 stats_every_h = 12        # syslog stats line (stops, queue, unique client IPs)
 errors_every_min = 30     # aggregated nsmart error line, only if there were errors

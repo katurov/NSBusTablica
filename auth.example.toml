@@ -1,0 +1,19 @@
+# NStupido API tokens - TEMPLATE (tracked in git).
+# Copy to auth.toml (git-ignored, next to config.toml), put real tokens in, restart the server:
+#   cp auth.example.toml auth.toml && chmod 600 auth.toml && ./nstupido-server.sh restart
+# Generate a token:  python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+# Tokens starting with CHANGE-ME, empty ones and ones shorter than 16 characters are refused (startup warning).
+# Clients outside [auth] trusted_networks send:  Authorization: Bearer <token>   (or X-Token: <token>, or ?token=<token>)
+# Any [auth] key from config.toml may be overridden here too (e.g. trusted_networks, trusted_proxies, enabled).
+
+[auth.tokens]
+friend01 = "CHANGE-ME-01"
+friend02 = "CHANGE-ME-02"
+friend03 = "CHANGE-ME-03"
+friend04 = "CHANGE-ME-04"
+friend05 = "CHANGE-ME-05"
+friend06 = "CHANGE-ME-06"
+friend07 = "CHANGE-ME-07"
+friend08 = "CHANGE-ME-08"
+friend09 = "CHANGE-ME-09"
+friend10 = "CHANGE-ME-10"
