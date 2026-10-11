@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""NStupido - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops as compact JSON:
-live data + memory + official timetable (gspns.rs).
+"""NStupido v4 - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops: live data + memory + official timetable
+(gspns.rs), served as JSON and as text frames for the WiFi OLED board.
 
-CLI:     python3 nstupido.py [STOP_UID ...] [--merge] [--pretty] [--state FILE | --no-state]
-                             [--no-schedule | --schedule-only] [--no-feeders]
-         (default stops: 6539 15889 6712)
-Server:  python3 nstupido.py --serve [--port 8080] [--host 0.0.0.0] [--interval 15]
-         GET /buses                 -> default stops
-         GET /buses?stop=6551       -> that stop (comma-separated list allowed: ?stop=6539,6551)
-         GET /buses?merge=1         -> all buses of the requested stops in one list sorted by time
+CLI:     python3 nstupido.py [STOP_UID ...] [--merge] [--pretty] [--no-schedule | --schedule-only] [--no-feeders]
+Server:  python3 nstupido.py --serve [--config config.toml] [--host 0.0.0.0] [--port 8080]
+         GET /                      -> usage, default stops, watch list with expiry, queue, backoff
+         GET /buses?stop=6551       -> JSON for that stop (comma-separated list allowed, &merge=1)
+         GET /frame?stop=6551       -> text frame for the board (H|stop|HH:MM|flags, R|line|G:3|P:20, E)
          GET /debug                 -> timetable status, feeders, learned travel times, recent arrivals
+         Codes: 200 (maybe "warming": true / "live": false), 400 bad uid, 404 no such stop in nsmart,
+                429 queue full (Retry-After), 503 starting (Retry-After).
+
+Everything except the gspns timetable cache (cache/gspns/) lives in memory. nsmart is polled by one queue:
+each watched stop followed by its feeder stops, spacing max(0.4 s, 40 s / N), at most 100 requests per 40 s
+cycle, global exponential backoff 5..180 s. Config: config.toml. Logs: syslog (daemon, ident nstupido) + stderr.
 
 Every board entry has a status:
   "live"      (Sveže)          - in a fresh upstream snapshot (of the stop itself or of a preceding stop)
   "lost"      (Videli-izgubili) - seen earlier, now estimated from memory (countdown)
   "scheduled" (Po rasporedu)    - from the official timetable: departure + travel time to the stop, not seen yet
-A scheduled trip is matched to a live bus by line + trip departure time (+-1 min), else the nearest one of the
-same line within +-6 min, and is never shown twice.
-Stdlib only. Data: https://online.nsmart.rs/sr/najava-dolaska/ (undocumented, no auth), http://gspns.rs/red-voznje
+Stdlib only (Python >= 3.9; config.toml read with tomllib / tomli / a built-in mini parser).
 """
-import json, os, sys, time, argparse, threading, signal, statistics
-from concurrent.futures import ThreadPoolExecutor
+import json, os, re, sys, time, argparse, threading, signal, statistics, random, logging, logging.handlers, collections
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,7 +43,6 @@ SEED_FEEDERS = {"6539": ["6540", "6750", "6679"], "6712": ["6586", "6728"], "158
 FEEDERS_PER_STOP = 4
 STATIONS_URL = "https://online.nsmart.rs/sr/AnnouncementForStation/getAllStations"
 STATIONS_CACHE = os.path.join(HERE, "stations_cache.json")
-STATE_FILE = os.path.join(HERE, "state.json")
 STATIONS_MAX_AGE = 7 * 24 * 3600
 TRUNCATED_LEN = 50             # upstream cuts station_name in arrival responses to 50 chars
 KNOWN_NAMES = {                # full names (from getAllStations) for the default stops
@@ -53,12 +53,9 @@ KNOWN_NAMES = {                # full names (from getAllStations) for the defaul
 TIMEOUT = 15
 
 # --- memory tuning ---
-POLL_INTERVAL = 15             # server background poll, seconds (upstream snapshot cadence ~15-20 s)
-FEEDER_EVERY = 2               # poll preceding stops every N-th round
 ZERO_HOLD = 30                 # drop an estimated bus that has been at 0 s for this long
 HOLD_EXTRA = 120               # keep an unseen bus at most last_seconds_left + HOLD_EXTRA ...
 HOLD_MAX = 20 * 60             # ... but never longer than this
-WATCH_TTL = 10 * 60            # server: stop polling a non-default stop not requested for this long
 VEHICLE_TTL = 30 * 60          # forget vehicle positions older than this
 LIVE_MAX_AGE = 40              # "live" = seen (directly or via a preceding stop) within this many seconds
 
@@ -141,6 +138,7 @@ def full_name(uid, name):
                     with open(STATIONS_CACHE, encoding="utf-8") as f:
                         _names = json.load(f)
                 else:
+                    GATE.wait()
                     req = urllib.request.Request(STATIONS_URL, data=b"", headers={
                         "User-Agent": "Mozilla/5.0 (NStupido home board)", "X-Requested-With": "XMLHttpRequest"})
                     with urllib.request.urlopen(req, timeout=30) as r:
@@ -262,35 +260,6 @@ class Memory:
                       "routes": {}, "names": {}, "to": {}}
         self.matched = {}            # trip_id -> {"key", "stop", "t"}  (scheduled trip already shown as a real bus)
         self.arrivals = []           # recent arrival observations (debug / accuracy)
-
-    # -- persistence --
-    def load(self, path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                st = json.load(f)
-        except (OSError, ValueError):
-            return
-        with self.lock:
-            self.stops = st.get("stops", {})
-            self.vehicles = st.get("vehicles", {})
-            for k, v in (st.get("learn") or {}).items():
-                if isinstance(v, dict):
-                    self.learn.setdefault(k, {}).update(v)
-            self.matched = st.get("matched", {})
-            self.arrivals = st.get("arrivals", [])[-200:]
-
-    def save(self, path):
-        with self.lock:
-            data = json.dumps({"saved_at": time.time(), "stops": self.stops, "vehicles": self.vehicles,
-                               "learn": self.learn, "matched": self.matched, "arrivals": self.arrivals[-200:]},
-                              ensure_ascii=False, separators=(",", ":"))
-        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(data)
-            os.replace(tmp, path)
-        except OSError:
-            pass
 
     # -- learning --
     def observe_routes(self, buses, now):
@@ -580,14 +549,6 @@ class Memory:
             return out
 
 
-def _parallel(fn, items):
-    if not items:
-        return []
-    if len(items) == 1:
-        return [fn(items[0])]
-    with ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
-        return list(ex.map(fn, items))
-
 def combine(results, merge=False):
     if merge:
         buses, stops, errors = [], [], []
@@ -614,93 +575,606 @@ def dumps(obj):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-# ---------------- polling ----------------
-TT = timetable.Timetables()
-MEM = Memory(TT)
-_watch, _watch_lock = {}, threading.Lock()   # uid -> last requested (non-default stops)
-_state_path = None
-_snaplog = None                               # optional JSONL log of every upstream snapshot (debug)
-_use_feeders = True
+# ---------------- config ----------------
+CONFIG_FILE = os.path.join(HERE, "config.toml")
+DEFAULT_CONFIG = {
+    "server": {"host": "0.0.0.0", "port": 8080, "timezone": "Europe/Belgrade"},
+    "stops": {"default": list(DEFAULT_STOPS)},
+    "polling": {"cycle_s": 40, "min_interval_s": 0.4, "watch_ttl_h": 4, "backoff_min_s": 5, "backoff_max_s": 180,
+                "assumed_feeders": 3},
+    "timetable": {"refresh_at": "05:00", "pause_s": [1, 2], "retry_min": 15, "retries": 3},
+    "logging": {"stats_every_h": 12, "errors_every_min": 30},
+}
 
-def poll_once(stops, feeders=True):
-    """Fetch our stops (+ their preceding stops), project feeder buses onto our stops, update memory."""
-    fmap = {uid: (MEM.feeders(uid) if feeders and _use_feeders else []) for uid in stops}
-    extra = [f for f in dict.fromkeys(x for fs in fmap.values() for x in fs) if f not in stops]
-    allq = list(stops) + extra
-    res = dict(zip(allq, _parallel(fetch, allq)))
-    now = time.time()
-    MEM.observe_routes([b for r in res.values() for b in r.get("buses", [])], now)
-    round_obs = {}
-    for uid in stops:
-        direct = res[uid]
+
+def _mini_toml(text):
+    """Tiny TOML subset (tables, key = string / number / bool / flat array) for Pythons without tomllib/tomli."""
+    out, cur = {}, None
+    for raw in text.splitlines():
+        line = re.sub(r"""#(?=(?:[^"']|"[^"]*"|'[^']*')*$).*""", "", raw).strip()
+        if not line:
+            continue
+        m = re.fullmatch(r"\[\s*([A-Za-z0-9_.-]+)\s*\]", line)
+        if m:
+            cur = out
+            for part in m.group(1).split("."):
+                cur = cur.setdefault(part, {})
+            continue
+        k, sep, v = line.partition("=")
+        if not sep:
+            raise ValueError("bad config line: %r" % raw)
+        v = re.sub(r"'([^']*)'", lambda mm: json.dumps(mm.group(1)), v.strip())
+        (cur if cur is not None else out)[k.strip().strip('"')] = json.loads(v)
+    return out
+
+
+def parse_toml(text):
+    try:
+        import tomllib                                   # Python 3.11+
+        return tomllib.loads(text)
+    except ImportError:
+        pass
+    try:
+        import tomli                                     # pip install tomli (optional)
+        return tomli.loads(text)
+    except ImportError:
+        return _mini_toml(text)
+
+
+def load_config(path=None):
+    """DEFAULT_CONFIG overlaid with the file (missing file = defaults)."""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    path = path or CONFIG_FILE
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            data = parse_toml(f.read())
+        for sec, vals in data.items():
+            if isinstance(vals, dict):
+                cfg.setdefault(sec, {}).update(vals)
+    cfg["stops"]["default"] = [str(x) for x in cfg["stops"]["default"]]
+    return cfg
+
+
+# ---------------- logging (syslog: facility daemon, ident nstupido) ----------------
+LOG = logging.getLogger("nstupido")
+
+
+def setup_logging(to_stderr=True):
+    LOG.setLevel(logging.INFO)
+    LOG.handlers[:] = []
+    LOG.propagate = False
+    for addr in ("/var/run/syslog", "/dev/log"):          # macOS, Linux
+        if os.path.exists(addr):
+            try:
+                h = logging.handlers.SysLogHandler(address=addr, facility=logging.handlers.SysLogHandler.LOG_DAEMON)
+                h.ident = "nstupido: "
+                h.setFormatter(logging.Formatter("%(message)s"))
+                LOG.addHandler(h)
+                break
+            except OSError:
+                pass
+    if to_stderr or not LOG.handlers:
+        h = logging.StreamHandler(sys.stderr)
+        h.setFormatter(logging.Formatter("%(asctime)s nstupido: %(message)s", "%Y-%m-%d %H:%M:%S"))
+        LOG.addHandler(h)
+
+
+# ---------------- rate limit / backoff ----------------
+class Gate:
+    """Global nsmart pacing: at least `min_interval` s between two requests, plus exponential backoff after a
+    failure (5, 10, 20, ... s, capped at backoff_max); the first success resets it. Global on purpose: a ban hits
+    the whole server, not one stop."""
+
+    def __init__(self, min_interval=0.4, backoff_min=5, backoff_max=180, clock=time.monotonic, sleep=time.sleep):
+        self.min_interval, self.backoff_min, self.backoff_max = min_interval, backoff_min, backoff_max
+        self.clock, self.sleep = clock, sleep
+        self.lock = threading.Lock()
+        self.next_at = None
+        self.failures = 0
+        self.requests = 0
+
+    def wait(self):
+        with self.lock:
+            if self.next_at is not None:
+                d = self.next_at - self.clock()
+                if d > 0:
+                    self.sleep(d)
+            self.next_at = self.clock() + self.min_interval
+            self.requests += 1
+
+    def backoff_s(self):
+        return 0 if not self.failures else min(self.backoff_max, self.backoff_min * 2 ** (self.failures - 1))
+
+    def in_backoff(self):
+        return self.failures > 0
+
+    def failure(self):
+        self.failures += 1
+        self.next_at = max(self.next_at or 0, self.clock() + self.backoff_s())
+
+    def success(self):
+        self.failures = 0
+
+
+GATE = Gate()
+
+
+def error_kind(err):
+    """Upstream error dict -> aggregation key ("timeout", "http 503", ...) or None if nsmart said the stop does
+    not exist (a valid answer, not a failure)."""
+    t = err.get("type")
+    if t == "api" and (err.get("code") == 3 or err.get("message") == "unknown stop uid"):
+        return None
+    if t == "http":
+        return "http %s" % err.get("status")
+    if t == "network":
+        return "timeout" if "timed out" in str(err.get("message", "")).lower() else "network"
+    if t == "bad_response":
+        return "bad response"
+    return "api %s" % err.get("code")
+
+
+class ErrorLog:
+    """Counts nsmart errors; flush() returns at most one summary line per window, None if there were none."""
+
+    def __init__(self, every_s=1800, clock=time.time):
+        self.every_s, self.clock = every_s, clock
+        self.lock = threading.Lock()
+        self.counts = collections.Counter()
+        self.window_start = clock()
+
+    def record(self, kind):
+        with self.lock:
+            self.counts[kind] += 1
+
+    def flush(self, backoff_s=0, now=None):
+        now = self.clock() if now is None else now
+        with self.lock:
+            if now - self.window_start < self.every_s:
+                return None
+            total = sum(self.counts.values())
+            line = None
+            if total:
+                parts = ", ".join("%s %d" % (k, n) for k, n in sorted(self.counts.items(), key=lambda kv: (-kv[1], kv[0])))
+                line = "nsmart errors: %d in last %d min (%s), backoff %d s" % (
+                    total, round((now - self.window_start) / 60), parts, backoff_s)
+            self.counts.clear()
+            self.window_start = now
+            return line
+
+
+class Clients:
+    """Unique client IPs seen in the last `window_s` seconds."""
+
+    def __init__(self, window_s=12 * 3600, clock=time.time):
+        self.window_s, self.clock = window_s, clock
+        self.lock = threading.Lock()
+        self.seen = {}
+
+    def hit(self, ip):
+        with self.lock:
+            self.seen[ip] = self.clock()
+
+    def count(self):
+        now = self.clock()
+        with self.lock:
+            for ip in [i for i, t in self.seen.items() if now - t > self.window_s]:
+                del self.seen[ip]
+            return len(self.seen)
+
+
+# ---------------- watch list + polling plan ----------------
+class Watch:
+    """Default stops (never expire) + dynamic stops, each with expiry = last request + ttl."""
+
+    def __init__(self, defaults, ttl_s=4 * 3600, clock=time.time):
+        self.defaults = list(dict.fromkeys(defaults))
+        self.ttl_s, self.clock = ttl_s, clock
+        self.dynamic = {}                        # uid -> expiry (insertion ordered)
+        self.lock = threading.RLock()
+
+    def is_watched(self, uid):
+        with self.lock:
+            return uid in self.defaults or uid in self.dynamic
+
+    def touch(self, uid):
+        """Extend a dynamic stop's timer; True if the stop is watched."""
+        with self.lock:
+            if uid in self.defaults:
+                return True
+            if uid in self.dynamic:
+                self.dynamic[uid] = self.clock() + self.ttl_s
+                return True
+            return False
+
+    def add(self, uid):
+        with self.lock:
+            if uid not in self.defaults:
+                self.dynamic[uid] = self.clock() + self.ttl_s
+
+    def remove(self, uid):
+        with self.lock:
+            self.dynamic.pop(uid, None)
+
+    def expire(self):
+        now = self.clock()
+        with self.lock:
+            gone = [u for u, t in self.dynamic.items() if t <= now]
+            for u in gone:
+                del self.dynamic[u]
+            return gone
+
+    def stops(self):
+        with self.lock:
+            return self.defaults + [u for u in self.dynamic if u not in self.defaults]
+
+    def snapshot(self):
+        with self.lock:
+            return {**{u: None for u in self.defaults}, **dict(self.dynamic)}
+
+
+def plan_groups(stops, feeders_of):
+    """[(stop, [feeders])]: each watched stop followed by its preceding stops."""
+    return [(s, [f for f in feeders_of(s) if f != s]) for s in stops]
+
+
+def plan_sequence(groups):
+    """Unique request order for one cycle; a feeder shared by several stops (or itself watched) is requested once."""
+    seq = []
+    for s, fs in groups:
+        for u in [s] + list(fs):
+            if u not in seq:
+                seq.append(u)
+    return seq
+
+
+def spacing(n, cycle_s=40, min_interval_s=0.4):
+    """Seconds between two requests with n requests per cycle: a small queue is polled gently."""
+    return cycle_s if n <= 0 else max(min_interval_s, cycle_s / n)
+
+
+def capacity(cycle_s=40, min_interval_s=0.4):
+    return int(round(cycle_s / min_interval_s))
+
+
+# ---------------- timetable refresh schedule ----------------
+def _hhmm(s):
+    h, m = (int(x) for x in s.split(":"))
+    return h, m
+
+
+def last_mark(now_dt, at="05:00"):
+    """Most recent `at` (local time of now_dt) at or before now_dt."""
+    h, m = _hhmm(at)
+    t = now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+    return t if t <= now_dt else t - timedelta(days=1)
+
+
+def next_mark(now_dt, at="05:00"):
+    """Next `at` strictly after now_dt."""
+    return last_mark(now_dt, at) + timedelta(days=1)
+
+
+def timetable_due(refreshed_ts, now_dt, at="05:00"):
+    """Refresh needed if never refreshed, or the last refresh is older than today's (or, before `at`, yesterday's) mark."""
+    if not refreshed_ts:
+        return True
+    return datetime.fromtimestamp(refreshed_ts, now_dt.tzinfo) < last_mark(now_dt, at)
+
+
+def local_tz(name):
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
+class TimetableRefresher:
+    """Startup + daily refresh at `refresh_at` local; failed refresh -> retry after retry_min, up to `retries` times."""
+
+    def __init__(self, service, tt, cfg, now_dt=None):
+        tc = cfg["timetable"]
+        self.svc, self.tt = service, tt
+        self.at, self.retry_s, self.max_retries = tc["refresh_at"], tc["retry_min"] * 60, tc["retries"]
+        tz = local_tz(cfg["server"]["timezone"])
+        self.now_dt = now_dt or (lambda: datetime.now(tz))
+        self.retries = 0
+
+    def step(self):
+        """Run one check (maybe a refresh); returns seconds to sleep until the next check."""
+        now = self.now_dt()
+        if timetable_due(self.tt.refreshed_at(), now, self.at):
+            ok = self.tt.refresh(today=now.date(), force=True, stops=set(self.svc.watch.stops()))
+            r = self.tt.last_result or {}
+            LOG.info("timetable refresh: %s, %d fetched, %d failed%s", "ok" if ok else "FAILED", r.get("fetched", 0),
+                     r.get("failed", 0), "" if ok else " (%s)" % self.tt.last_error)
+            self.svc.ready.set()
+            if not ok and self.retries < self.max_retries:
+                self.retries += 1
+                return self.retry_s
+            self.retries = 0
+        self.svc.ready.set()
+        return max(1.0, (next_mark(self.now_dt(), self.at) - self.now_dt()).total_seconds())
+
+
+# ---------------- service: queue, polling, answers ----------------
+class Service:
+    def __init__(self, cfg, mem, fetch_fn=None, gate=None, clock=time.time, sleep=time.sleep, use_feeders=True):
+        pol = cfg["polling"]
+        self.cfg, self.mem = cfg, mem
+        self.fetch = fetch_fn or fetch
+        self.gate = gate or GATE
+        self.clock, self.sleep = clock, sleep
+        self.cycle_s, self.min_interval_s = float(pol["cycle_s"]), float(pol["min_interval_s"])
+        self.cap = capacity(self.cycle_s, self.min_interval_s)
+        self.assumed_feeders = int(pol.get("assumed_feeders", 3))
+        self.use_feeders = use_feeders
+        self.watch = Watch(cfg["stops"]["default"], float(pol["watch_ttl_h"]) * 3600, clock)
+        self.missing = {}                         # uid -> when nsmart said "no such stop"
+        self.urgent = collections.deque()
+        self.errors = ErrorLog(cfg["logging"]["errors_every_min"] * 60, clock)
+        self.clients = Clients(cfg["logging"]["stats_every_h"] * 3600, clock)
+        self.ready = threading.Event()
+        self.stopping = threading.Event()
+        self.lock = threading.RLock()
+
+    # -- plan --
+    def feeders_of(self, uid):
+        return self.mem.feeders(uid) if self.use_feeders else []
+
+    def groups(self):
+        return plan_groups(self.watch.stops(), self.feeders_of)
+
+    def queue_length(self):
+        return len(plan_sequence(self.groups()))
+
+    def interval(self):
+        return spacing(self.queue_length(), self.cycle_s, self.min_interval_s)
+
+    def group_cost(self, uid, seq=None):
+        """New requests per cycle that watching `uid` would add (unknown stop: itself + assumed feeders)."""
+        seq = plan_sequence(self.groups()) if seq is None else seq
+        with self.mem.lock:
+            known = uid in self.mem.stops
+        fs = self.feeders_of(uid)
+        if not known and not fs and self.use_feeders:
+            return 1 + self.assumed_feeders
+        return len([u for u in [uid] + fs if u not in seq])
+
+    def planned_load(self, seq=None):
+        """Requests per cycle, counting assumed feeders for accepted stops not polled yet."""
+        seq = plan_sequence(self.groups()) if seq is None else seq
+        pending = 0
+        if self.use_feeders:
+            with self.mem.lock:
+                pending = sum(1 for u in self.watch.stops() if u not in self.mem.stops and not self.feeders_of(u))
+        return len(seq) + pending * self.assumed_feeders
+
+    # -- client requests --
+    def admit(self, uid):
+        """-> "ok" (watched, timer extended), "new" (accepted, warming), "missing" (404) or "full" (429)."""
+        with self.lock:
+            if uid in self.missing:
+                return "missing"
+            if self.watch.touch(uid):
+                return "ok"
+            seq = plan_sequence(self.groups())
+            if self.planned_load(seq) + self.group_cost(uid, seq) > self.cap:
+                return "full"
+            self.watch.add(uid)
+            self.urgent.append(uid)
+            return "new"
+
+    def warming(self, uid):
+        with self.mem.lock:
+            st = self.mem.stops.get(uid)
+            return not (st and st.get("fetched_at"))
+
+    def answer(self, uid):
+        live = not self.gate.in_backoff()
+        v = self.mem.view(uid, schedule=self.mem.tt is not None, live=live)
+        v["warming"] = self.warming(uid)
+        v["live"] = live
+        return v
+
+    # -- upstream --
+    def request(self, uid):
+        self.gate.wait()
+        r = self.fetch(uid)
+        err = r.get("error")
+        if err:
+            kind = error_kind(err)
+            if kind is None:
+                self.gate.success()
+                self._mark_missing(uid)
+            else:
+                self.gate.failure()
+                self.errors.record(kind)
+        else:
+            self.gate.success()
+        self.mem.observe_routes(r.get("buses", []), self.clock())
+        return r
+
+    def _mark_missing(self, uid):
+        with self.lock:
+            if uid in self.watch.defaults or not self.watch.is_watched(uid):
+                return                             # a default stop is never dropped; a feeder is just useless
+            self.missing[uid] = self.clock()
+            self.watch.remove(uid)
+        with self.mem.lock:
+            self.mem.stops.pop(uid, None)
+        LOG.info("stop %s does not exist in nsmart, dropped", uid)
+
+    def process(self, uid, direct, feeder_results):
+        """Merge a stop's own snapshot with buses projected from its feeders into memory."""
         obs = {}
         if "error" not in direct:
             for b in direct["buses"]:
-                if b.get("planned"):
-                    continue
-                obs["%s|%s" % (b["garage_no"], b["line"])] = dict(b, source="direct")
-        for f in fmap[uid]:
-            for b in res.get(f, {}).get("buses", []):
+                if not b.get("planned"):
+                    obs["%s|%s" % (b["garage_no"], b["line"])] = dict(b, source="direct")
+        for f, res in feeder_results.items():
+            for b in res.get("buses", []):
                 key = "%s|%s" % (b["garage_no"], b["line"])
                 if key in obs or b.get("planned"):
-                    continue                      # direct observation wins
+                    continue                       # direct observation wins
                 ob = project(b, f, uid)
                 if ob:
                     obs[key] = ob
         snap = dict(direct)
         snap["buses"] = list(obs.values())
-        round_obs[uid] = [[b["garage_no"], b["line"], b.get("source", "direct"), b["seconds"], b.get("dep")] for b in obs.values()]
         if "error" in direct and obs:
             snap["name"] = None
-        MEM.update(uid, snap, now)
-    if _snaplog:
-        try:
-            with open(_snaplog, "a", encoding="utf-8") as f:
-                f.write(dumps({"t": now, "feeders": fmap, "obs": round_obs, "snaps": {
-                    k: {kk: ([{x: y for x, y in b.items() if not x.startswith("_")} for b in vv] if kk == "buses" else vv)
-                        for kk, vv in v.items()} for k, v in res.items()}}) + "\n")
-        except OSError:
-            pass
-    if _state_path:
-        MEM.save(_state_path)
-    return res
+        self.mem.update(uid, snap, self.clock())
 
-def poller(interval):
-    n = 0
-    while True:
-        t0 = time.time()
-        with _watch_lock:
-            for uid in [u for u, t in _watch.items() if t0 - t > WATCH_TTL]:
-                del _watch[uid]
-            stops = list(dict.fromkeys(DEFAULT_STOPS + list(_watch)))
-        try:
-            poll_once(stops, feeders=(n % FEEDER_EVERY == 0))
-        except Exception as e:      # never let the poller die
-            sys.stderr.write("poller error: %r\n" % e)
-        n += 1
-        time.sleep(max(1.0, interval - (time.time() - t0)))
+    def poll_group(self, uid, fetched, pace):
+        """Stop first (reveals routes -> feeders), then its feeders back to back; reuse what this cycle fetched."""
+        if uid not in fetched:
+            pace()
+            fetched[uid] = self.request(uid)
+        if uid in self.missing:
+            return
+        fs = self.feeders_of(uid)
+        for f in fs:
+            if f not in fetched:
+                pace()
+                fetched[f] = self.request(f)
+        self.process(uid, fetched[uid], {f: fetched[f] for f in fs})
 
-def tt_refresher():
-    try:
-        TT.refresh()
-    except Exception as e:
-        sys.stderr.write("timetable refresh error: %r\n" % e)
-    while True:
-        time.sleep(600)
-        try:
-            TT.maybe_refresh(min_interval=1800)
-        except Exception as e:
-            sys.stderr.write("timetable refresh error: %r\n" % e)
+    def _serve_urgent(self, fetched):
+        while self.urgent:
+            uid = self.urgent.popleft()
+            if self.watch.is_watched(uid):
+                self.poll_group(uid, fetched, lambda: None)      # the gate still enforces min_interval
+
+    def _wait_until(self, t, fetched):
+        while not self.stopping.is_set():
+            self._serve_urgent(fetched)
+            d = t - self.clock()
+            if d <= 0:
+                return
+            self.sleep(min(d, 0.2))
+
+    def run_cycle(self):
+        for uid in self.watch.expire():
+            with self.mem.lock:
+                self.mem.stops.pop(uid, None)
+        t0 = self.clock()
+        groups = self.groups()
+        iv = spacing(len(plan_sequence(groups)), self.cycle_s, self.min_interval_s)
+        fetched, last = {}, [None]
+
+        def pace():
+            if last[0] is not None:
+                self._wait_until(last[0] + iv, fetched)
+            last[0] = self.clock()
+
+        for uid, _ in groups:
+            if self.stopping.is_set():
+                break
+            self._serve_urgent(fetched)
+            if self.watch.is_watched(uid):
+                self.poll_group(uid, fetched, pace)
+        if last[0] is not None:
+            self._wait_until(max(t0 + self.cycle_s, last[0] + iv), fetched)
+        return fetched
+
+    def poll_forever(self):
+        while not self.stopping.is_set():
+            try:
+                self.run_cycle()
+            except Exception as e:                # never let the poller die
+                LOG.info("poller error: %r", e)
+                self.sleep(5)
+
+    # -- logging --
+    def stats_line(self):
+        st = self.watch.stops()
+        nd = len(self.watch.defaults)
+        return "stats: %d stops watched (%d default, %d dynamic), queue %d requests/cycle (interval %.1f s, limit %d), " \
+               "%d clients in last %g h" % (len(st), nd, len(st) - nd, self.queue_length(), self.interval(), self.cap,
+                                            self.clients.count(), self.cfg["logging"]["stats_every_h"])
+
+    def housekeeping_forever(self):
+        every = self.cfg["logging"]["stats_every_h"] * 3600
+        last_stats = self.clock()
+        while not self.stopping.wait(30):
+            line = self.errors.flush(self.gate.backoff_s())
+            if line:
+                LOG.info(line)
+            if self.clock() - last_stats >= every:
+                last_stats = self.clock()
+                LOG.info(self.stats_line())
+
+    def status(self):
+        tz = local_tz(self.cfg["server"]["timezone"])
+        return {"usage": {"GET /buses?stop=<uid>": "JSON arrivals (G/E/P), stops comma-separated, &merge=1",
+                          "GET /frame?stop=<uid>": "text frame for the OLED board (H/R/E lines)",
+                          "GET /debug": "timetable + learning internals"},
+                "default_stops": list(self.watch.defaults),
+                "watch": {u: (datetime.fromtimestamp(t, tz).isoformat(timespec="seconds") if t else None)
+                          for u, t in self.watch.snapshot().items()},
+                "queue": {"length": self.queue_length(), "limit": self.cap, "interval_s": round(self.interval(), 2),
+                          "cycle_s": self.cycle_s},
+                "backoff": {"active": self.gate.in_backoff(), "failures": self.gate.failures,
+                            "seconds": self.gate.backoff_s()},
+                "ready": self.ready.is_set()}
+
+
+# ---------------- board frame (text, same protocol as the USB bridge) ----------------
+_ASCII = str.maketrans({"Č": "C", "Ć": "C", "Ž": "Z", "Š": "S", "Đ": "D", "č": "c", "ć": "c", "ž": "z", "š": "s",
+                        "đ": "d", '"': None, "|": None})
+FRAME_MAX_ROUTES = 24
+
+
+def ascii_line(line):
+    return (line or "?").translate(_ASCII).encode("ascii", "replace").decode()[:5] or "?"
+
+
+def frame_rows(buses, max_routes=FRAME_MAX_ROUTES):
+    """Routes nearest-first, up to 2 cells each: ["R|8|G:3|P:20", ...]."""
+    key = lambda b: b.get("seconds") if b.get("seconds") is not None else 10 ** 9
+    by_line = {}
+    for b in sorted(buses, key=key):
+        by_line.setdefault(ascii_line(b.get("line")), []).append(b)
+    rows = []
+    for line, bl in list(by_line.items())[:max_routes]:
+        cells = []
+        for b in bl[:2]:
+            mins = max(0, int(key(b) // 60)) if b.get("seconds") is not None else 0
+            tag = {"live": "G", "lost": "E"}.get(b.get("status"), "P")
+            cells.append("%s:%d" % (tag, mins))
+        rows.append("|".join(["R", line] + cells))
+    return rows
+
+
+def frame_text(view, now_dt):
+    flags = ("W" if view.get("warming") else "") + ("" if view.get("live", True) else "O")
+    head = "H|%s|%s|%s" % (view["stop"]["uid"], now_dt.strftime("%H:%M"), flags)
+    return "\n".join([head] + frame_rows(view.get("buses") or []) + ["E"]) + "\n"
+
+
+# ---------------- HTTP ----------------
+UID_RE = re.compile(r"^\d{1,7}$")
+SERVICE = None                                  # set by serve()
+
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NStupido/3.0"
+    server_version = "NStupido/4.0"
+    service = None                              # tests may set a class attribute; default: SERVICE
 
-    def _send(self, status, obj):
-        body = dumps(obj).encode("utf-8")
+    @property
+    def svc(self):
+        return self.service or SERVICE
+
+    def _send(self, status, obj, headers=None, text=None):
+        body = (text if text is not None else dumps(obj)).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", "text/plain; charset=utf-8" if text is not None else "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, str(v))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if self.command != "HEAD":
@@ -713,108 +1187,153 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
 
+    def _client_ip(self):
+        xff = self.headers.get("X-Forwarded-For")
+        return xff.split(",")[0].strip() if xff else self.client_address[0]
+
+    def resolve(self, q):
+        """-> (status, obj, headers, views) for /buses and /frame."""
+        svc = self.svc
+        stops = [s.strip() for v in q.get("stop", []) for s in v.split(",") if s.strip()] or list(svc.watch.defaults)
+        bad = [s for s in stops if not UID_RE.match(s)]
+        if bad:
+            return 400, {"error": {"type": "bad_request", "message": "stop uid must be 1-7 digits: %s" % bad[0]}}, {}, None
+        if not svc.ready.is_set():
+            return 503, {"error": {"type": "starting", "message": "server is starting (timetable)"}}, {"Retry-After": 10}, None
+        for s in stops:
+            r = svc.admit(s)
+            if r == "missing":
+                return 404, {"error": {"type": "not_found", "message": "stop %s does not exist in nsmart" % s}}, {}, None
+            if r == "full":
+                return 429, {"error": "stop limit reached", "limit": svc.cap}, {"Retry-After": 600}, None
+        return 200, None, {}, [svc.answer(s) for s in stops]
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         p = u.path.rstrip("/")
         q = urllib.parse.parse_qs(u.query)
-        flag = lambda name: (q.get(name) or ["0"])[-1].lower() in ("1", "true", "yes", "on")
+        svc = self.svc
+        svc.clients.hit(self._client_ip())
         if p == "":
-            return self._send(200, {"usage": "GET /buses[?stop=6539[,6551]][&merge=1][&schedule=0|only]", "default_stops": DEFAULT_STOPS})
+            return self._send(200, svc.status())
         if p == "/debug":
-            with MEM.lock:
-                learn = {"travel": MEM.learn["travel"], "tt": MEM.learn["tt"], "names": MEM.learn["names"]}
-                arr = MEM.arrivals[-50:]
-            return self._send(200, {"timestamp": _iso(), "timetable": TT.status(),
-                                    "feeders": {s: MEM.feeders(s) for s in DEFAULT_STOPS},
-                                    "learn": learn, "arrivals": arr})
-        if p != "/buses":
+            mem = svc.mem
+            with mem.lock:
+                learn = {"travel": mem.learn["travel"], "tt": mem.learn["tt"], "names": mem.learn["names"]}
+                arr = mem.arrivals[-50:]
+            return self._send(200, {"timestamp": _iso(), "timetable": mem.tt.status() if mem.tt else None,
+                                    "feeders": {s: svc.feeders_of(s) for s in svc.watch.stops()},
+                                    "missing": list(svc.missing), "learn": learn, "arrivals": arr})
+        if p not in ("/buses", "/frame"):
             return self._send(404, {"error": {"type": "not_found", "message": "use GET /buses?stop=<uid>"}})
-        stops = [s.strip() for v in q.get("stop", []) for s in v.split(",") if s.strip()] or list(DEFAULT_STOPS)
-        if not all(s.isdigit() for s in stops):
-            return self._send(400, {"timestamp": _iso(), "error": {"type": "bad_request", "message": "stop must be numeric"}})
-        merge = flag("merge")
-        sched_q = (q.get("schedule") or ["1"])[-1].lower()
-        schedule, live = sched_q not in ("0", "false", "no", "off"), sched_q != "only"
-        now = time.time()
-        with _watch_lock:
-            for s in stops:
-                if s not in DEFAULT_STOPS:
-                    _watch[s] = now
-        with MEM.lock:
-            missing = [s for s in stops if s not in MEM.stops]
-        if missing and live:             # first request for a stop: fetch synchronously
-            poll_once(missing)
-        results = [MEM.view(s, schedule=schedule, live=live) for s in stops]
-        self._send(502 if live and all_failed(results) else 200, combine(results, merge))
+        status, obj, headers, views = self.resolve(q)
+        if p == "/frame":
+            if views is None:
+                msg = obj["error"] if isinstance(obj["error"], str) else obj["error"]["message"]
+                return self._send(status, None, headers, text="ERR|%d|%s\n" % (status, msg))
+            now_dt = datetime.now(local_tz(svc.cfg["server"]["timezone"]))
+            return self._send(200, None, headers, text=frame_text(views[0], now_dt))
+        if views is None:
+            return self._send(status, obj, headers)
+        flag = (q.get("merge") or ["0"])[-1].lower() in ("1", "true", "yes", "on")
+        self._send(200, combine(views, flag))
 
     do_HEAD = do_GET
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+        pass                                      # the board asks every 5 s; no access log
+
+
+# ---------------- main ----------------
+def serve(cfg, host, port, use_schedule=True, use_feeders=True):
+    global SERVICE
+    tc = cfg["timetable"]
+    pause = tuple(tc["pause_s"])
+    tt = timetable.Timetables(pause=lambda: time.sleep(random.uniform(*pause))) if use_schedule else None
+    GATE.min_interval = float(cfg["polling"]["min_interval_s"])
+    GATE.backoff_min, GATE.backoff_max = float(cfg["polling"]["backoff_min_s"]), float(cfg["polling"]["backoff_max_s"])
+    svc = SERVICE = Service(cfg, Memory(tt), use_feeders=use_feeders)
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+
+    def _term(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
+    LOG.info("start: listening on %s:%d, default stops %s, cycle %gs, min interval %gs, limit %d requests/cycle",
+             host, port, ",".join(svc.watch.defaults), svc.cycle_s, svc.min_interval_s, svc.cap)
+    if tt is not None:
+        if tt.data:
+            svc.ready.set()                      # a cached (maybe stale) timetable is good enough to answer
+        ref = TimetableRefresher(svc, tt, cfg)
+
+        def tt_loop():
+            while not svc.stopping.is_set():
+                try:
+                    d = ref.step()
+                except Exception as e:
+                    LOG.info("timetable refresh error: %r", e)
+                    svc.ready.set()
+                    d = 900
+                svc.stopping.wait(d)
+        threading.Thread(target=tt_loop, daemon=True, name="timetable").start()
+    else:
+        svc.ready.set()
+    threading.Thread(target=svc.poll_forever, daemon=True, name="poller").start()
+    threading.Thread(target=svc.housekeeping_forever, daemon=True, name="housekeeping").start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        svc.stopping.set()
+        srv.server_close()
+        LOG.info("stop: %s", svc.stats_line())
+    return 0
 
 
 def main():
-    global _state_path, _snaplog, _use_feeders
     ap = argparse.ArgumentParser(description="Upcoming Novi Sad buses as JSON (live + memory + timetable)")
-    ap.add_argument("stops", nargs="*", help="stop uid(s), default %s" % " ".join(DEFAULT_STOPS))
+    ap.add_argument("stops", nargs="*", help="stop uid(s), default: [stops] default in config.toml")
+    ap.add_argument("--config", default=CONFIG_FILE, help="config file (default: %(default)s)")
     ap.add_argument("--merge", action="store_true", help="one list of buses from all stops, sorted by time")
     ap.add_argument("--serve", action="store_true", help="run HTTP server with background poller")
-    ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--interval", type=float, default=POLL_INTERVAL, help="server poll interval, s")
-    ap.add_argument("--state", default=STATE_FILE, help="memory state file (default: %(default)s)")
-    ap.add_argument("--no-state", action="store_true", help="do not load/save memory")
+    ap.add_argument("--port", type=int, default=None, help="override [server] port")
+    ap.add_argument("--host", default=None, help="override [server] host")
     ap.add_argument("--no-schedule", action="store_true", help="do not use the gspns.rs timetable")
     ap.add_argument("--schedule-only", action="store_true", help="timetable entries only, no live fetch (debug)")
     ap.add_argument("--no-feeders", action="store_true", help="do not poll preceding stops")
     ap.add_argument("--pretty", action="store_true", help="indented JSON (CLI)")
-    ap.add_argument("--log-snapshots", metavar="FILE", help="append every upstream snapshot to FILE (JSONL, debug)")
     a = ap.parse_args()
-    _snaplog = a.log_snapshots
-    _state_path = None if a.no_state else a.state
-    _use_feeders = not a.no_feeders
-    if a.no_schedule:
-        MEM.tt = None
-    if _state_path:
-        MEM.load(_state_path)
+    cfg = load_config(a.config)
+    DEFAULT_STOPS[:] = cfg["stops"]["default"]
     if a.serve:
-        def _term(signum, frame):
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, _term)     # kill PID -> save state and exit cleanly
-        if MEM.tt is not None:
-            threading.Thread(target=tt_refresher, daemon=True).start()
-        threading.Thread(target=poller, args=(a.interval,), daemon=True).start()
-        srv = ThreadingHTTPServer((a.host, a.port), Handler)
-        sys.stderr.write("NStupido serving on http://%s:%d/buses (poll every %gs, state %s)\n"
-                         % (a.host, a.port, a.interval, _state_path))
-        try:
-            srv.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            srv.server_close()
-            if _state_path:
-                MEM.save(_state_path)
-            sys.stderr.write("NStupido stopped, state saved\n")
-        return 0
+        setup_logging()
+        return serve(cfg, a.host or cfg["server"]["host"], a.port or int(cfg["server"]["port"]),
+                     use_schedule=not a.no_schedule, use_feeders=not a.no_feeders)
     stops = [s for s in a.stops if s] or list(DEFAULT_STOPS)
-    bad = [s for s in stops if not s.isdigit()]
+    bad = [s for s in stops if not UID_RE.match(s)]
     if bad:
         res = combine([{"stop": {"uid": s, "name": None}, "timestamp": _iso(),
                         "error": {"type": "bad_request", "message": "stop uid must be numeric"}} for s in stops], a.merge)
         print(dumps(res))
         return 1
-    if MEM.tt is not None:
+    tt = None if a.no_schedule else timetable.Timetables()
+    if tt is not None:
         try:
-            MEM.tt.maybe_refresh(min_interval=600)
+            tt.maybe_refresh(min_interval=600)
         except Exception:
             pass
+    cfg["stops"]["default"] = stops
+    svc = Service(cfg, Memory(tt), use_feeders=not a.no_feeders)
     if not a.schedule_only:
-        poll_once(stops)
-    results = [MEM.view(s, schedule=MEM.tt is not None, live=not a.schedule_only) for s in stops]
+        fetched = {}
+        for s in stops:                          # sequential, paced by GATE (>= 0.4 s apart)
+            svc.poll_group(s, fetched, lambda: None)
+    results = [svc.mem.view(s, schedule=tt is not None, live=not a.schedule_only) for s in stops]
     res = combine(results, a.merge)
     print(json.dumps(res, ensure_ascii=False, indent=1) if a.pretty else dumps(res))
     return 1 if not a.schedule_only and all_failed(results) else 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

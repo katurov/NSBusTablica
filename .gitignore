@@ -27,3 +27,7 @@ firmware/.vscode/
 .AppleDouble
 local*.ini
 *.local
+
+# Firmware secrets (WiFi credentials)
+firmware/secrets.ini
+*.pid

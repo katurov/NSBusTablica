@@ -1,0 +1,27 @@
+# NStupido server configuration (the only hand-edited file). Missing keys fall back to built-in defaults.
+
+[server]
+host = "0.0.0.0"          # listen on the LAN
+port = 8080
+timezone = "Europe/Belgrade"
+
+[stops]
+default = ["6539", "15889", "6712"]   # always polled, never expire
+
+[polling]
+cycle_s = 40              # every watched stop is refreshed once per cycle
+min_interval_s = 0.4      # never more than one nsmart request per 0.4 s -> limit 100 requests/cycle
+watch_ttl_h = 4           # a requested (non-default) stop is dropped 4 h after its last request
+backoff_min_s = 5         # after an nsmart failure: 5, 10, 20, 40, 80 s ...
+backoff_max_s = 180       # ... capped at 180 s; first success resets
+assumed_feeders = 3       # capacity estimate for a stop never seen before
+
+[timetable]
+refresh_at = "05:00"      # daily gspns.rs refresh, local time
+pause_s = [1, 2]          # random pause between two gspns requests
+retry_min = 15            # failed refresh: retry after 15 min ...
+retries = 3               # ... up to 3 times
+
+[logging]
+stats_every_h = 12        # syslog stats line (stops, queue, unique client IPs)
+errors_every_min = 30     # aggregated nsmart error line, only if there were errors

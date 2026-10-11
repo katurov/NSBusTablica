@@ -44,8 +44,6 @@ Fail message always contains URL/host — shows which upstream is dead.
 
 ```bash
 python3 nstupido.py 6539 --pretty
-# without saving state:
-python3 nstupido.py 6539 --pretty --no-state
 # schedule only (without nsmart):
 python3 nstupido.py 6539 --pretty --schedule-only
 ```
@@ -100,21 +98,22 @@ curl -sS 'http://gspns.rs/red-voznje/gradski?selected_lang=lat' | head -c 2000
 curl -sS 'http://gspns.rs/red-voznje/ispis-polazaka?rv=rvg&vaziod=2026-10-01&dan=R&linija%5B%5D=3.' | head -c 2000
 ```
 
-## 6. OLED / USB Bridge
+## 6. OLED Board (WiFi, v4)
 
-1. Server: `python3 nstupido.py --serve --port 8080`
-2. Firmware already uploaded (`pio run -t upload` in `firmware/`).
-3. Bridge: `pip install -r requirements.txt` → `python3 oled_bridge.py --stop 6539`
-4. **Don't open** the same serial port in `pio device monitor` / another process while bridge holds it — will get «veza izgubljena» / port failure.
-5. Brightness: `OLED_CONTRAST` in `firmware/platformio.ini` (currently 40 out of 255).
+1. Server running: `./nstupido-server.sh status` (start: `./nstupido-server.sh start`; on the Mac `PYTHON=/opt/homebrew/bin/python3.10`).
+2. Same URL the board uses: `curl -s http://nstupido.teamof.top:8080/` (200, `"ready": true`) and `curl -s "http://nstupido.teamof.top:8080/frame?stop=6539"` (lines `H|…`, `R|…`, `E`).
+3. Board log over USB (nothing else may hold the port): `pio device monitor` in `firmware/` → `[nstupido] GET http://…/frame?stop=6539 -> 200` every 5 s. `-1` = server unreachable (DNS / firewall / server down), `503` = server starting.
+4. Server side: `tail nstupido.log`; `GET /` shows queue, backoff, watch list.
+5. Legacy USB bridge: `python3 oled_bridge.py --stop 6539` (requires `pyserial`); don't open the serial monitor at the same time.
+6. Brightness: `OLED_CONTRAST` in `firmware/platformio.ini` (currently 40 out of 255).
 
 ## 7. Agent Success Checklist
 
 - [ ] `python3 -c "import nstupido, timetable, rs_holidays"` without errors
-- [ ] Offline: `unittest discover -s tests` — all `test_schedule` green
+- [ ] Offline: `unittest discover -s tests` — `test_server`, `test_schedule`, `test_bridge`, `test_firmware_frame` green
 - [ ] Live: `tests.test_live_sources` — all 5 green (or clearly indicated that network from box/machine is unavailable)
 - [ ] CLI `nstupido.py 6539 --pretty` returns JSON with `stop` + `buses` (or meaningful `error`)
-- [ ] If needed: `/buses` and `/debug` respond 200
+- [ ] If needed: `/`, `/buses`, `/frame` and `/debug` respond 200
 - [ ] If fixed upstream parsing — update fixtures in `tests/fixtures/`, don't mock live tests
 
 No API keys. Sources are undocumented and may change without notice.

@@ -60,9 +60,12 @@ for _l in ["52", "53", "54", "55", "60", "61", "62", "63", "64", "68", "69", "71
                                 "tt": {_l: _SUB_TT.get(_l, 2), **{n: (4 if n == "72IS" else _SUB_TT.get(_l, 2)) for n in _names.values()}}})
 DEFAULT_TT_MIN = 2
 
-def needed_lines():
+def needed_lines(stops=None):
+    """{rv: {base lines}} for the given stops (default: all configured stops)."""
     out = {}
-    for cfgs in STOP_LINES.values():
+    for uid, cfgs in STOP_LINES.items():
+        if stops is not None and uid not in stops:
+            continue
         for c in cfgs:
             out.setdefault(c["rv"], set()).add(c["base"])
     return out
@@ -155,14 +158,23 @@ def _get(path, params=None, opener=None):
 class Timetables:
     """Thread-safe holder of the gspns index (day type per date, validity dates) and cached timetables."""
 
-    def __init__(self, cache_dir=CACHE_DIR, fetch=None):
+    def __init__(self, cache_dir=CACHE_DIR, fetch=None, pause=None):
         self.cache_dir = cache_dir
-        self.fetch = fetch or _get            # injectable for tests: fetch(path, params) -> html
+        self._raw_fetch = fetch or _get        # injectable for tests: fetch(path, params) -> html
+        self.pause = pause                     # called between two gspns requests (polite pacing), or None
+        self._requests = 0
+        self.last_result = None                # {"at", "ok", "fetched", "failed"} of the last refresh
         self.lock = threading.RLock()
         self.index = {"day_types": {}, "vaziod": [], "checked": None, "ok_at": None}
         self.data = {}                         # vaziod -> {"fetched", "lines": {rv: {dan: {base: table}}}}
         self.last_error = None
         self._load()
+
+    def fetch(self, path, params=None):
+        if self.pause and self._requests:
+            self.pause()
+        self._requests += 1
+        return self._raw_fetch(path, params)
 
     # -- cache files --
     def _path(self, name):
@@ -191,16 +203,20 @@ class Timetables:
         os.replace(tmp, self._path(name))
 
     # -- refresh --
-    def refresh(self, today=None, force=False, max_age_days=7):
+    def refresh(self, today=None, force=False, max_age_days=7, stops=None):
         """Read today's day type + validity dates, fetch timetables for validity dates not cached (or older than
-        max_age_days). On any network error keep whatever is cached. Returns True if the index fetch worked."""
+        max_age_days, or all with force=True) for the lines of `stops` (default: all configured stops).
+        A (line group, day type) that fails keeps its previous copy. On an index error keep whatever is cached.
+        Returns True if the index fetch worked and no timetable request failed."""
         today = today or date.today()
+        self._requests = 0
         with self.lock:
             self.index["checked"] = time.time()
         try:
             idx = parse_index(self.fetch("/red-voznje/gradski", {"selected_lang": "lat"}))
         except Exception as e:
             self.last_error = "index: %r" % e
+            self.last_result = {"at": time.time(), "ok": False, "fetched": 0, "failed": 1}
             return False
         with self.lock:
             if idx["day_type"]:
@@ -215,12 +231,12 @@ class Timetables:
             self._save("index.json", self.index)
             todo = [v for v in self.index["vaziod"]
                     if force or v not in self.data or time.time() - self.data[v].get("fetched", 0) > max_age_days * 86400]
+        fetched = failed = 0
         for v in todo:
-            try:
-                lines = self._fetch_timetable(v)
-            except Exception as e:
-                self.last_error = "timetable %s: %r" % (v, e)
-                continue
+            with self.lock:
+                old = (self.data.get(v) or {}).get("lines") or {}
+            lines, ok, bad = self._fetch_timetable(v, stops=stops, old=old)
+            fetched, failed = fetched + ok, failed + bad
             if not any(lines.get(rv, {}).get(d) for rv in lines for d in DAY_TYPES):
                 self.last_error = "timetable %s: empty" % v
                 continue
@@ -228,18 +244,37 @@ class Timetables:
             with self.lock:
                 self.data[v] = obj
                 self._save("timetable_%s.json" % v, obj)
-        return True
+        ok = failed == 0
+        with self.lock:
+            if ok:
+                self.index["refreshed_at"] = time.time()
+                self._save("index.json", self.index)
+        self.last_result = {"at": time.time(), "ok": ok, "fetched": fetched, "failed": failed}
+        return ok
 
-    def _fetch_timetable(self, vaziod):
-        lines = {}
-        for rv, bases in needed_lines().items():
+    def _fetch_timetable(self, vaziod, stops=None, old=None):
+        """-> (lines, ok_count, failed_count); a failed (rv, day type) keeps its copy from `old`."""
+        lines, ok, bad = {}, 0, 0
+        old = old or {}
+        for rv, bases in needed_lines(stops).items():
             for dan in DAY_TYPES:
-                opts = parse_line_options(self.fetch("/red-voznje/lista-linija", {"rv": rv, "vaziod": vaziod, "dan": dan}))
-                want = [o for o in opts if o.rstrip(".*") in bases]
-                tables = parse_timetables(self.fetch("/red-voznje/ispis-polazaka",
-                                                     {"rv": rv, "vaziod": vaziod, "dan": dan, "linija[]": want})) if want else {}
-                lines.setdefault(rv, {})[dan] = tables
-        return lines
+                try:
+                    opts = parse_line_options(self.fetch("/red-voznje/lista-linija", {"rv": rv, "vaziod": vaziod, "dan": dan}))
+                    want = [o for o in opts if o.rstrip(".*") in bases]
+                    tables = parse_timetables(self.fetch("/red-voznje/ispis-polazaka",
+                                                         {"rv": rv, "vaziod": vaziod, "dan": dan, "linija[]": want})) if want else {}
+                    ok += 1
+                except Exception as e:
+                    self.last_error = "timetable %s %s %s: %r" % (vaziod, rv, dan, e)
+                    tables = old.get(rv, {}).get(dan, {})
+                    bad += 1
+                prev = old.get(rv, {}).get(dan, {})
+                lines.setdefault(rv, {})[dan] = {**prev, **tables}   # lines of stops not refreshed now stay
+        return lines, ok, bad
+
+    def refreshed_at(self):
+        with self.lock:
+            return self.index.get("refreshed_at") or (self.index.get("ok_at") if self.data else None)
 
     def maybe_refresh(self, now=None, min_interval=3600):
         """Refresh if the day changed since the last successful index fetch, or every min_interval s if it failed."""

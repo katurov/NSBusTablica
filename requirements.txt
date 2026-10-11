@@ -1,5 +1,9 @@
 # NStupido — Python dependencies
 #
-# Core (nstupido.py, timetable.py, rs_holidays.py): stdlib only — nothing to install.
-# OLED USB bridge (oled_bridge.py) needs pyserial:
+# Core server (nstupido.py, timetable.py, rs_holidays.py): stdlib only, Python >= 3.9 — nothing to install.
+# config.toml: Python 3.11+ has tomllib; on older Pythons tomli is used if installed, otherwise a built-in
+# parser for the simple config subset. Optional:
+# tomli>=2.0 ; python_version < "3.11"
+#
+# Legacy OLED USB bridge (oled_bridge.py) needs pyserial:
 pyserial>=3.5
