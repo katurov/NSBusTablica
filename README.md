@@ -109,6 +109,7 @@ The server may be reachable from outside the LAN (`nstupido.teamof.top`), so v4.
 - **`X-Forwarded-For`** is ignored unless the direct peer is in `[auth] trusted_proxies` (e.g. `["127.0.0.1/32"]` behind a local nginx). Then the right-most forwarded address that is not itself a proxy is the client. Otherwise anyone could claim to be on the LAN.
 - `GET /` shows the per-client list (addresses, last request) only to trusted networks. Token clients get the rest.
 - Logs: `token friend01 first request from 1.2.3.4: /frame?stop=6539` (once per token name per run); rejected requests are never logged one by one, only `unauthorized: 37 requests in last 30 min from 3 address(es)` at most every 30 min and only if there were any; the 12 h `stats:` line ends with `requests by token: friend01 120, phone 7`.
+- **Scanner noise (v4.3):** connections reset / broken / timed out mid-request and malformed requests (e.g. TLS sent to plain HTTP → `400`) print no tracebacks; they are summarised at most every 30 min, only if non-zero: `dropped: 12 connections in last 30 min from 4 address(es)`, `bad requests: 7 in last 30 min from 3 address(es)`. Idle connections are closed after 15 s (handler timeout; the board's request takes milliseconds). Any other exception is logged once with its full traceback.
 
 Use from outside:
 
@@ -229,6 +230,7 @@ python3 -m unittest discover -s tests -v          # offline + live
 python3 -m unittest tests.test_server -v          # v4 server: queue math, groups, capacity/429, TTL, backoff,
                                                   # log aggregation, HTTP codes, timetable refresh schedule
 python3 -m unittest tests.test_schedule -v        # schedule, matching, feeders
+python3 -m unittest tests.test_conn -v            # v4.3: resets / timeouts / bad requests counted, not printed
 python3 -m unittest tests.test_auth -v            # v4.2: trusted networks, tokens, CHANGE-ME, mapped IPv6, proxies, 401 log
 python3 -m unittest tests.test_routes -v          # v4.1: route names, map matching, mark rules, cache age rules,
                                                   # new-stop flow, unknown live route, HTTP counters

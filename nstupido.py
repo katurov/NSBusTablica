@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NStupido v4.1 - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops: live data + memory + official timetable
+"""NStupido v4.3 - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops: live data + memory + official timetable
 (gspns.rs), served as JSON and as text frames for the WiFi OLED board. Any stop works: its lines come from the
 nsmart station list, their direction from the gspns network map (routes.py), missing timetables are fetched on the
 first request. Display: base route only (14S -> 14, 1GL -> 1), letters only for distinct routes (3A, 7B, 18A).
@@ -24,7 +24,7 @@ Every board entry has a status:
   "scheduled" (Po rasporedu)    - from the official timetable: departure + travel time to the stop, not seen yet
 Stdlib only (Python >= 3.9; config.toml read with tomllib / tomli / a built-in mini parser).
 """
-import json, os, re, sys, time, argparse, threading, signal, statistics, random, logging, logging.handlers, collections
+import json, os, re, sys, time, errno, socket, traceback, argparse, threading, signal, statistics, random, logging, logging.handlers, collections
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -799,6 +799,73 @@ class ErrorLog:
             return line
 
 
+class ConnLog:
+    """Scanner noise: connections dropped mid-request (reset, broken pipe, timeout) and malformed requests
+    (e.g. TLS sent to plain HTTP -> 400). Counted per address, summarised at most once per window."""
+
+    def __init__(self, every_s=1800, clock=time.time):
+        self.every_s, self.clock = every_s, clock
+        self.lock = threading.Lock()
+        self.dropped, self.bad = collections.Counter(), collections.Counter()
+        self.window_start = clock()
+
+    def drop(self, ip):
+        with self.lock:
+            self.dropped[str(ip)] += 1
+
+    def bad_request(self, ip):
+        with self.lock:
+            self.bad[str(ip)] += 1
+
+    def flush(self, now=None):
+        now = self.clock() if now is None else now
+        with self.lock:
+            if now - self.window_start < self.every_s:
+                return []
+            mins = round((now - self.window_start) / 60)
+            out = []
+            for what, c in (("dropped", self.dropped), ("bad requests", self.bad)):
+                n = sum(c.values())
+                if n:
+                    out.append("%s: %d %s in last %d min from %d address(es)" % (
+                        what, n, "connections" if what == "dropped" else "", mins, len(c)))
+                c.clear()
+            self.window_start = now
+        return [re.sub(r"  +", " ", l) for l in out]
+
+
+CONN_ERRNOS = {errno.ECONNRESET, errno.EPIPE, errno.ETIMEDOUT, errno.ECONNABORTED, errno.ENOTCONN}
+
+
+def is_connection_error(exc):
+    """Errors caused by the peer going away / stalling, not by our code."""
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.timeout)):
+        return True
+    try:
+        import ssl
+        if isinstance(exc, ssl.SSLError):
+            return True
+    except ImportError:
+        pass
+    return isinstance(exc, OSError) and exc.errno in CONN_ERRNOS
+
+
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer that counts connection-level errors instead of printing tracebacks to stderr."""
+    daemon_threads = True
+    service = None
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        svc = self.service or SERVICE
+        ip = client_address[0] if client_address else "?"
+        if is_connection_error(exc):
+            if svc is not None:
+                svc.conn.drop(ip)
+            return
+        LOG.error("error while handling request from %s:\n%s", ip, traceback.format_exc().rstrip())
+
+
 class Clients:
     """Unique client IPs seen in the last `window_s` seconds."""
 
@@ -1025,6 +1092,7 @@ class Service:
         self.errors = ErrorLog(cfg["logging"]["errors_every_min"] * 60, clock)
         self.clients = Clients(cfg["logging"]["stats_every_h"] * 3600, clock)
         self.auth = auth.Auth(cfg.get("auth"), clock)
+        self.conn = ConnLog(cfg["logging"]["errors_every_min"] * 60, clock)
         self.ready = threading.Event()
         self.stopping = threading.Event()
         self.lock = threading.RLock()
@@ -1316,6 +1384,8 @@ class Service:
             line = self.errors.flush(self.gate.backoff_s())
             if line:
                 LOG.info(line)
+            for line in self.conn.flush():
+                LOG.info(line)
             line = self.auth.flush_denied(self.cfg["logging"]["errors_every_min"] * 60)
             if line:
                 LOG.info(line)
@@ -1391,7 +1461,8 @@ SERVICE = None                                  # set by serve()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NStupido/4.2"
+    server_version = "NStupido/4.3"
+    timeout = 15                                # idle / slowloris connections are closed (counted as dropped)
     service = None                              # tests may set a class attribute; default: SERVICE
 
     @property
@@ -1507,6 +1578,19 @@ class Handler(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def log_error(self, fmt, *args):
+        """send_error (400 bad request line, 414, 501…) and 'Request timed out': counted, not printed."""
+        try:
+            svc = self.svc
+            if svc is not None:
+                ip = self.client_address[0]
+                if fmt.startswith("Request timed out"):
+                    svc.conn.drop(ip)
+                else:
+                    svc.conn.bad_request(ip)
+        except Exception:
+            pass
+
     def log_message(self, fmt, *args):
         pass                                      # the board asks every 5 s; no access log
 
@@ -1539,7 +1623,8 @@ def serve(cfg, host, port, use_schedule=True, use_feeders=True):
     GATE.min_interval = float(cfg["polling"]["min_interval_s"])
     GATE.backoff_min, GATE.backoff_max = float(cfg["polling"]["backoff_min_s"]), float(cfg["polling"]["backoff_max_s"])
     svc = SERVICE = build_service(cfg, tt, use_feeders=use_feeders)
-    srv = ThreadingHTTPServer((host, port), Handler)
+    srv = Server((host, port), Handler)
+    srv.service = svc
     srv.daemon_threads = True
 
     def _term(signum, frame):
