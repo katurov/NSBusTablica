@@ -48,6 +48,18 @@ int main() {
   CHECK(p3.parseBody("H|1|1:00\nR|L6|G:0\nR|L1\nR|L2\nR|L3\nR|L4\nR|L5\nE\n", h));
   pageNames(h, pg, names, shown, pages); CHECK(!strcmp(names, "L5 L6 ") && shown == 1);
   pageNames(h, pg, names, shown, pages); CHECK(!strncmp(names, "L6 ", 3) && shown == 0);
+  // v4.4 N line: stop name in UTF-8, optional, ignored outside a frame
+  CHECK(p.parseBody("H|6539|09:05|\nN|Bulevar kralja Petra prvog-Ma\xc5\xa1inska \xc5\xa1kola\nR|8|G:3\nE\n", f));
+  CHECK(!strcmp(f.name, "Bulevar kralja Petra prvog-Ma\xc5\xa1inska \xc5\xa1kola") && f.n == 1);
+  CHECK(p.parseBody("H|6539|09:05\nR|8|G:3\nE\n", f) && f.name[0] == 0);       // old server: no name
+  {
+    char body[400]; int o = snprintf(body, sizeof body, "H|1|09:05\nN|");
+    for (int i = 0; i < 60; i++) o += snprintf(body + o, sizeof body - o, "\xc5\xa1");   // 120 bytes of 'š'
+    snprintf(body + o, sizeof body - o, "\nE\n");
+    CHECK(p.parseBody(body, f));
+    size_t n = strlen(f.name);
+    CHECK(n < NAME_BYTES && n % 2 == 0 && ((unsigned char)f.name[n - 1]) == 0xa1);   // whole characters only
+  }
   // routes vanish mid-cycle -> restart at page 1
   pg.reset(); makeFrame(f, 5); pageNames(f, pg, names, shown, pages);
   makeFrame(f, 3); pageNames(f, pg, names, shown, pages); CHECK(shown == 0 && pages == 1);

@@ -1,6 +1,6 @@
 # NStupido
 
-Home display for upcoming buses in GSP Novi Sad: live nsmart data + memory between snapshots + official gspns.rs schedule → compact JSON, HTTP API, and a **WiFi** OLED 128×64 board (Wemos S2 mini). A research prototype built for fun, together with Grok Bot.
+Home display for upcoming buses in GSP Novi Sad: live nsmart data + memory between snapshots + official gspns.rs schedule → compact JSON, HTTP API, and two **WiFi** boards: an OLED 128×64 (Wemos S2 mini) and a colour 240×135 LilyGO TTGO T-Display. A research prototype built for fun, together with Grok Bot.
 
 ## v4 in short
 
@@ -8,6 +8,7 @@ Home display for upcoming buses in GSP Novi Sad: live nsmart data + memory betwe
 - **Board** connects to WiFi and fetches `GET <SERVER_URL>/frame?stop=<uid>` every 5 s; BOOT button cycles the compiled stop list; more than 4 routes → pages.
 - **USB bridge** (`oled_bridge.py`) is legacy/optional: the v4 firmware still draws frames arriving over USB serial.
 - **v4.1 – any stop:** ask for any nsmart stop and, after ~15 s of `"warming"`, get the full list: live buses (G/E) plus the official timetable (P) of *every* line through that stop. Lines come from the nsmart station list, their direction from the gspns network map, missing timetables are downloaded on the spot (paced). The board shows the **base route** only (`14S` → `14`, `1GL` → `1`); letters stay only where they name a different route (`3A`, `7B`, `18A`).
+- **v4.4 – colour board + stop names:** `/frame` gains an optional `N|<stop name>` line (UTF-8; older boards ignore it). New PlatformIO env `tdisplay` for the TTGO T-Display: stop number + scrolling stop name in a light blue header, colour-coded waits, two buttons (stops / pages). See [T-Display board](#t-display-board-v44).
 - **v4.2 – access control:** LAN (`192.168.42.0/24`) and localhost need nothing; other clients need a named token (`Authorization: Bearer …`) from the untracked `auth.toml`, otherwise `401`. See [Access / tokens](#access--tokens).
 
 Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md). Data sources, the route naming model and *why* things are done this way: **[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)**.
@@ -25,7 +26,8 @@ Design spec and status: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md). Data sources, th
 | `routes.py` | Route naming (base / variant / direction), nsmart station list + gspns network map caches, stop → lines derivation, live learning |
 | `tools/compare_lines.py` | Offline check: automatic stop → lines derivation vs hand-made `STOP_LINES`, departure by departure |
 | `rs_holidays.py` | Republic of Serbia holidays (incl. Orthodox Easter) for fallback day type |
-| `firmware/` | PlatformIO project for the WiFi OLED board; `include/frame.h` = frame parser + pager (host-testable) |
+| `firmware/` | PlatformIO project: env `lolin_s2_mini` (OLED, `src/main.cpp`, default) and env `tdisplay` (TTGO T-Display, `src/tdisplay.cpp`); `include/frame.h` = frame parser + pager (host-testable), `include/hdr_font.h` = T-Display header font |
+| `tools/make_vlw.py` | Generates `firmware/include/hdr_font.h` (anti-aliased TFT_eSPI smooth font, ASCII + č ć š ž đ) from a TTF |
 | `firmware/secrets.ini.example` | Template for the untracked `firmware/secrets.ini` (WiFi SSID / password) |
 | `oled_bridge.py` | Legacy USB bridge: reads `/buses`, sends frames over serial |
 | `tests/` | Offline unit tests (server, schedule, bridge, firmware frame) + live connectivity (`test_live_sources.py`) |
@@ -151,12 +153,15 @@ curl "http://nstupido.teamof.top:8080/buses?stop=6660&token=<token>"
 
 ```
 H|6539|12:33|W        stop | server time | flags: W = warming, O = offline (nsmart backoff)
+N|Bulevar kralja Petra prvog-Mašinska škola     optional (v4.4): stop name, UTF-8, whitespace collapsed, max 80 chars
 R|8|G:1|P:31          route | up to 2 cells: G live, E estimate, P timetable (minutes)
 R|3|E:6|P:33
 E
 ```
 
 Errors on `/frame` come as `ERR|<code>|<message>` with the same HTTP codes.
+
+The `N` line (v4.4) is a new line type rather than a new `H` field or a query parameter: the S2 mini firmware and `frame.h` before v4.4 skip unknown line types, so old boards keep working unchanged and every board gets the same response. The name is the full nsmart station name (from the station list when the stop has not been polled yet); it stays UTF-8 because the colour board can draw Serbian Latin letters, while route names in `R` lines stay ASCII-folded for the OLED fonts. No name known → no `N` line.
 
 ### `config.toml`
 
@@ -189,7 +194,7 @@ Python 3.11+ reads it with `tomllib`; older Pythons use `tomli` if installed, el
 
 ## Firmware (WiFi board)
 
-Wemos/LOLIN S2 mini + 128×64 I2C OLED (SDA 18, SCL 16), PlatformIO env `lolin_s2_mini`.
+Wemos/LOLIN S2 mini + 128×64 I2C OLED (SDA 18, SCL 16), PlatformIO env `lolin_s2_mini` (the default env: `pio run -t upload` builds only this one). The colour board: [T-Display board](#t-display-board-v44).
 
 ### Secrets and build flags
 
@@ -223,6 +228,40 @@ pio device monitor                     # optional: "[nstupido] GET … -> 200" l
 
 `oled_bridge.py` (needs `pyserial`) still works with the v4 firmware: frames arriving over USB serial are drawn as sent (bridge does its own paging/header), WiFi fetching pauses while they keep coming (30 s), and BOOT then sends `BTN` to the bridge. Board → host lines: `OK`, `BTN`, `[nstupido] …` log lines (ignored by the bridge); `?` → `NStupido OLED v4`. Bridge flags: `--stop` (6539), `--stops` (server default stops), `--port` (auto), `--server-port` (8080), `--every` (5 s), `--once`. Don't run the bridge and a serial monitor at the same time.
 
+## T-Display board (v4.4)
+
+LilyGO TTGO T-Display: ESP32-D0WDQ6 (4 MB flash, no PSRAM), 1.14″ ST7789V IPS 135×240 used landscape (240×135), CP2104 USB-UART, buttons GPIO0 and GPIO35. Same server, same `/frame`, same stops, same error texts and retry rules as the OLED board. Built with Grok Bot.
+
+![T-Display, real framebuffer screenshots: 6539 (name scrolling) and 15889 (page 1 of 2)](docs/img/tdisplay.png)
+
+```bash
+cd firmware                                   # secrets.ini as for the OLED board
+pio run -e tdisplay -t upload --upload-port /dev/cu.usbserial-01EEA79E
+pio device monitor -e tdisplay                # "[nstupido] stop 6539 \"Bulevar …\" routes 2 page 1/1"
+```
+
+Layout (Paul's spec):
+- **Header**, top quarter (34 px), light blue: the **stop number** in black on a darker blue box (`*` warming, `!` nsmart offline; the box inverts while switching stops), then the **stop name** on one line in Roboto Condensed SemiBold 24 px, anti-aliased, black. A name that does not fit **scrolls** (marquee: 2 s pause at the start, then ~33 px/s, wraps with a gap); short names stay still. No `N` line from the server (older than v4.4) → the number alone.
+- **Routes**, one per row, 4 rows (`-DTD_ROWS=5` → 5 smaller rows): route number **bold** white, right-aligned in a fixed 5-character column; then up to two waits `<n> min`, coloured by source: **G** live = green, **P** timetable = orange, **E** estimate = yellow.
+- **Pages**: more routes than rows → dots at the right edge (current page white). Pages turn only by button; 30 s after the last page press the board goes back to page 1 (the nearest buses).
+- **Buttons**: left / GPIO0 = next stop (page 1); right / GPIO35 = next page. Same 30 ms debounce as the OLED board (the earlier phantom presses came from a changed debounce).
+- **Serial console** (115200): `?` → `NStupido T-Display v4.4`, `stop` / `page` = the buttons, `shot` = raw RGB565 framebuffer (240×135, big-endian) for screenshots.
+
+Why these choices:
+- **Two font systems.** Rows and messages use u8g2 bitmap fonts (helvB18 / helvR10) through `U8g2_for_TFT_eSPI`: crisp at small sizes, and the route rows were approved as they are. The header uses a TFT_eSPI smooth (anti-aliased) font: the first version used a 12 px bitmap font with the name wrapped over two lines and the clock/number in 8 px, and both were hard to read on the real screen. One 24 px line plus a marquee is readable from across the room and never cuts a name.
+- **Font file.** `tools/make_vlw.py` writes only the glyphs needed (printable ASCII + `ČčĆćŠšŽžĐđ…`, ~23 KB in flash) as a C array, so no SPIFFS upload step is needed. Roboto Condensed (SIL Open Font License) fits long Novi Sad names well.
+- **No flicker.** Everything is drawn into one 240×135 16-bit sprite (63 KB, allocated before WiFi) and pushed in one go; the marquee redraws and pushes only the 34 px header band every 30 ms, from `loop()`, so buttons stay responsive. A slow HTTP request (LAN: ~0.1 s, timeout 4 s) pauses the marquee for that long.
+- **Clock dropped** from the header (the OLED board keeps it): the space went to the number and the name.
+
+| Define | Default | Meaning |
+|---|---|---|
+| `TD_ROWS` | 4 | route rows per page (4: helvB18, 5: helvB14) |
+| `TFT_BRIGHTNESS` | 160 | backlight PWM 0…255 (GPIO4) |
+| `BTN_STOP` / `BTN_PAGE` | 0 / 35 | buttons, active low |
+| `SERVER_URL`, `STOPS`, `WIFI_*` | as for the OLED board | |
+
+TFT_eSPI is configured entirely by build flags in `platformio.ini` (`USER_SETUP_LOADED`, pins of Setup25_TTGO_T_Display), so the library needs no local edits.
+
 ## Tests
 
 ```bash
@@ -230,12 +269,13 @@ python3 -m unittest discover -s tests -v          # offline + live
 python3 -m unittest tests.test_server -v          # v4 server: queue math, groups, capacity/429, TTL, backoff,
                                                   # log aggregation, HTTP codes, timetable refresh schedule
 python3 -m unittest tests.test_schedule -v        # schedule, matching, feeders
+python3 -m unittest tests.test_server -v          # v4.4: N|<stop name> line in /frame (also covered above)
 python3 -m unittest tests.test_conn -v            # v4.3: resets / timeouts / bad requests counted, not printed
 python3 -m unittest tests.test_auth -v            # v4.2: trusted networks, tokens, CHANGE-ME, mapped IPv6, proxies, 401 log
 python3 -m unittest tests.test_routes -v          # v4.1: route names, map matching, mark rules, cache age rules,
                                                   # new-stop flow, unknown live route, HTTP counters
 python3 -m unittest tests.test_bridge -v          # legacy bridge: stop cycling, serial input, paging
-python3 -m unittest tests.test_firmware_frame -v  # firmware frame.h parser + pager, compiled with c++ (skipped without a compiler)
+python3 -m unittest tests.test_firmware_frame -v  # firmware frame.h parser (incl. N line, UTF-8 cut) + pager, compiled with c++ (skipped without a compiler)
 python3 -m unittest tests.test_live_sources -v    # upstream reachability (network)
 ```
 

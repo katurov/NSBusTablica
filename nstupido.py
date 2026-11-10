@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NStupido v4.3 - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops: live data + memory + official timetable
+"""NStupido v4.4 - upcoming buses for Novi Sad (JGSP / nsmart.rs) stops: live data + memory + official timetable
 (gspns.rs), served as JSON and as text frames for the WiFi OLED board. Any stop works: its lines come from the
 nsmart station list, their direction from the gspns network map (routes.py), missing timetables are fetched on the
 first request. Display: base route only (14S -> 14, 1GL -> 1), letters only for distinct routes (3A, 7B, 18A).
@@ -8,7 +8,7 @@ CLI:     python3 nstupido.py [STOP_UID ...] [--merge] [--pretty] [--no-schedule 
 Server:  python3 nstupido.py --serve [--config config.toml] [--host 0.0.0.0] [--port 8080]
          GET /                      -> usage, default stops, watch list with expiry, queue, backoff
          GET /buses?stop=6551       -> JSON for that stop (comma-separated list allowed, &merge=1)
-         GET /frame?stop=6551       -> text frame for the board (H|stop|HH:MM|flags, R|line|G:3|P:20, E)
+         GET /frame?stop=6551       -> text frame for the board (H|stop|HH:MM|flags, N|name, R|line|G:3|P:20, E)
          GET /debug                 -> timetable status, feeders, learned travel times, recent arrivals
          Codes: 200 (maybe "warming": true / "live": false), 400 bad uid, 401 outside the trusted networks without
                 a valid token (auth.py), 404 no such stop in nsmart, 429 queue full (Retry-After), 503 starting.
@@ -1449,10 +1449,23 @@ def frame_rows(buses, max_routes=FRAME_MAX_ROUTES):
     return rows
 
 
+FRAME_NAME_LEN = 80
+
+
+def frame_name(name):
+    """Stop name for the optional N line: UTF-8 kept (č ć š ž đ), whitespace collapsed, no '|', max 80 chars."""
+    name = re.sub(r"\s+", " ", (name or "").replace("|", " ")).strip()
+    return name[:FRAME_NAME_LEN]
+
+
 def frame_text(view, now_dt):
+    """H line, optional N|<stop name> (v4.4; older boards ignore unknown line types), R rows, E."""
     flags = ("W" if view.get("warming") else "") + ("" if view.get("live", True) else "O")
-    head = "H|%s|%s|%s" % (view["stop"]["uid"], now_dt.strftime("%H:%M"), flags)
-    return "\n".join([head] + frame_rows(view.get("buses") or []) + ["E"]) + "\n"
+    head = ["H|%s|%s|%s" % (view["stop"]["uid"], now_dt.strftime("%H:%M"), flags)]
+    name = frame_name(view["stop"].get("name"))
+    if name:
+        head.append("N|" + name)
+    return "\n".join(head + frame_rows(view.get("buses") or []) + ["E"]) + "\n"
 
 
 # ---------------- HTTP ----------------
@@ -1461,7 +1474,7 @@ SERVICE = None                                  # set by serve()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NStupido/4.3"
+    server_version = "NStupido/4.4"
     timeout = 15                                # idle / slowloris connections are closed (counted as dropped)
     service = None                              # tests may set a class attribute; default: SERVICE
 
@@ -1570,7 +1583,14 @@ class Handler(BaseHTTPRequestHandler):
                 msg = obj["error"] if isinstance(obj["error"], str) else obj["error"]["message"]
                 return self._send(status, None, headers, text="ERR|%d|%s\n" % (status, msg))
             now_dt = datetime.now(local_tz(svc.cfg["server"]["timezone"]))
-            return self._send(200, None, headers, text=frame_text(views[0], now_dt))
+            view = views[0]
+            if not view["stop"].get("name"):            # not fetched yet: name from the station list
+                try:
+                    uid = view["stop"]["uid"]
+                    view["stop"]["name"] = KNOWN_NAMES.get(uid) or (svc.stations.name(uid) if svc.stations else None)
+                except Exception:
+                    pass
+            return self._send(200, None, headers, text=frame_text(view, now_dt))
         if views is None:
             return self._send(status, obj, headers)
         flag = (q.get("merge") or ["0"])[-1].lower() in ("1", "true", "yes", "on")

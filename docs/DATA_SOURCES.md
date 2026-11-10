@@ -154,3 +154,10 @@ The server moved to its own host behind `nstupido.teamof.top:8080`, which may be
 ## 9. Scanner noise (v4.3), and why
 
 An Internet-facing port gets scanners. Python's `socketserver` prints a full traceback to stderr for every peer that resets the connection (`ConnectionResetError: [Errno 104]`), and `BaseHTTPRequestHandler` reports every TLS handshake sent to plain HTTP as a `400 Bad request version`. Neither says anything about the server's health, and they bury the lines that do. So connection-level errors (reset, broken pipe, aborted, timeout, SSL, `ECONNRESET`/`EPIPE`/`ETIMEDOUT`) and malformed requests are counted per address and summarised like the nsmart errors and 401s: at most one line per 30 min, only when non-zero. Real exceptions (bugs) still get a full traceback through the NStupido logger. A 15 s socket timeout per connection closes idle (slowloris-style) connections and counts them as dropped. The board sends one short request every 5 s and is unaffected.
+
+## 10. Stop names on the board (v4.4), and why
+
+The colour board (TTGO T-Display) has room for the stop name, so `/frame` now carries it in an optional line `N|<name>` after `H`. Where the name comes from: the nsmart arrivals response (`station_name`, cut to 50 characters upstream and restored from the station list, as in `/buses`), or, for a stop not polled yet, `KNOWN_NAMES` / the cached nsmart station list. The server only collapses whitespace (the 15889 name has a double space), removes `|`, and cuts at 80 characters; it does not abbreviate: the board scrolls a long name instead of shortening it (Paul's choice after seeing the first, two-line version).
+
+Why a new line type: the frame parser on the S2 mini (and `frame.h` before v4.4) ignores unknown line types, so the change needs no new firmware there and no query parameter; both boards get the same response. Why UTF-8: the name is shown as written (`Mašinska škola`, `Oslobođenja`); route names in `R` lines stay ASCII-folded because the OLED fonts have no diacritics. The board cuts names longer than its buffer on a UTF-8 character boundary.
+

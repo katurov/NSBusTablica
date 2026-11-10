@@ -190,3 +190,9 @@ Plan items 2.1 step 3 and 2.5 step 4 ("fetch the GSPNS timetable for any routes 
 ## 12. v4.2: access control (11 Oct 2026)
 
 Trusted networks (LAN, localhost) need no token; everyone else needs a named token in `Authorization: Bearer`, `X-Token` or `?token=`, otherwise a bare `401`. Tokens live in the untracked `auth.toml` (template `auth.example.toml`), so `git pull` deployments never touch them. Rationale: [DATA_SOURCES.md §8](DATA_SOURCES.md#8-access-control-v42-and-why); usage: README "Access / tokens". The board needs no change.
+
+## 13. v4.3: scanner noise, v4.4: colour board (10 Nov 2026)
+
+- v4.3: connection resets, timeouts and malformed requests are counted and summarised every 30 min instead of printing tracebacks ([DATA_SOURCES.md §9](DATA_SOURCES.md#9-scanner-noise-v43-and-why)).
+- v4.4: second board, LilyGO TTGO T-Display (PlatformIO env `tdisplay`, `firmware/src/tdisplay.cpp`), next to the unchanged S2 mini OLED board (env `lolin_s2_mini`, still the default env). Same protocol, polling, stops, errors and debounce; differences: header with stop number and the scrolling stop name, colour-coded waits (G green, P orange, E yellow), 4 routes per page, second button (GPIO35) turns pages instead of automatic paging. Server: optional `N|<stop name>` line in `/frame` ([DATA_SOURCES.md §10](DATA_SOURCES.md#10-stop-names-on-the-board-v44-and-why)); old boards ignore it, so the server can be updated before or after the boards. Usage and rationale for the layout: README "T-Display board (v4.4)".
+

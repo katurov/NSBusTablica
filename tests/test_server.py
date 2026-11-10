@@ -280,6 +280,19 @@ class FrameTest(unittest.TestCase):
         txt = N.frame_text(view, datetime(2026, 10, 11, 12, 34))
         self.assertEqual(txt, "H|6539|12:34|WO\nR|54A|P:1\nR|8|G:3|P:21\nR|54ZA|E:6\nE\n")
 
+    def test_frame_name_line(self):
+        # v4.4: optional N line with the stop name, UTF-8 kept for the colour board; no name -> no N line
+        view = {"stop": {"uid": "15889", "name": "Bulevar Oslobodjenja  Bulevar|Kralja\nPetra prvog prigrad"},
+                "buses": [{"line": "54", "seconds": 120, "status": "live"}]}
+        txt = N.frame_text(view, datetime(2026, 11, 10, 21, 5))
+        self.assertEqual(txt, "H|15889|21:05|\nN|Bulevar Oslobodjenja Bulevar Kralja Petra prvog prigrad\nR|54|G:2\nE\n")
+        view["stop"]["name"] = "Bulevar kralja Petra prvog-Mašinska škola"
+        self.assertIn("\nN|Bulevar kralja Petra prvog-Mašinska škola\n", N.frame_text(view, datetime(2026, 11, 10, 21, 5)))
+        self.assertEqual(N.frame_name("x" * 200), "x" * N.FRAME_NAME_LEN)
+        self.assertEqual(N.frame_name(None), "")
+        view["stop"]["name"] = "  "
+        self.assertNotIn("\nN|", N.frame_text(view, datetime(2026, 11, 10, 21, 5)))
+
 
 class HttpTest(unittest.TestCase):
     def setUp(self):
@@ -333,7 +346,7 @@ class HttpTest(unittest.TestCase):
         code, h, body = self.get("/frame?stop=6539")
         self.assertEqual(code, 200)
         self.assertTrue(h["Content-Type"].startswith("text/plain"))
-        self.assertRegex(body, r"^H\|6539\|\d\d:\d\d\|W\nE\n$")
+        self.assertRegex(body, r"^H\|6539\|\d\d:\d\d\|W\nN\|Bulevar kralja Petra prvog-Mašinska škola\nE\n$")
 
 
 class ConfigTest(unittest.TestCase):

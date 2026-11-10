@@ -3,6 +3,7 @@
 //
 // Text frame (server GET /frame?stop=<uid>, or the legacy USB bridge):
 //   H|<stop>|<HH:MM>[|<flags>]   flags: W = warming (stop just added), O = offline (nsmart backoff, timetable only)
+//   N|<stop name>                 optional (server v4.4+), UTF-8, max 80 chars; boards that don't know it ignore it
 //   R|<line>|<cell>|<cell>        0..2 cells, cell = G:<min> live, E:<min> estimate, P:<min> timetable
 //   E                             end of frame
 #pragma once
@@ -16,8 +17,9 @@
 
 struct Cell { char kind; int minutes; };
 struct Route { char line[6]; int n; Cell c[2]; };
+#define NAME_BYTES 100              // 80 chars of Serbian Latin (č ć š ž đ = 2 bytes in UTF-8)
 struct Frame {
-  char stop[12]; char time[8]; char flags[4];
+  char stop[12]; char time[8]; char flags[4]; char name[NAME_BYTES];
   Route r[MAX_ROUTES]; int n;
 };
 
@@ -58,6 +60,13 @@ struct FrameParser {
       copyField(pending.stop, sizeof pending.stop, p[1], pl[1]);
       if (np >= 3) copyField(pending.time, sizeof pending.time, p[2], pl[2]);
       if (np >= 4) copyField(pending.flags, sizeof pending.flags, p[3], pl[3]);
+    } else if (type == 'N' && np >= 2 && inFrame) {
+      size_t len = L - 2;                                   // the rest of the line ('|' never occurs in a name)
+      if (len >= sizeof pending.name) {                     // cut on a UTF-8 character boundary
+        len = sizeof pending.name - 1;
+        while (len && ((unsigned char)line[2 + len] & 0xC0) == 0x80) len--;
+      }
+      copyField(pending.name, sizeof pending.name, line + 2, len);
     } else if (type == 'R' && np >= 2 && inFrame && pending.n < MAX_ROUTES) {
       Route &r = pending.r[pending.n];
       copyField(r.line, sizeof r.line, p[1], pl[1]);
@@ -73,7 +82,7 @@ struct FrameParser {
 
   // Parse a whole HTTP body; true if it contained a complete frame.
   bool parseBody(const char *body, Frame &out) {
-    bool ok = false; char line[128]; size_t n = 0;
+    bool ok = false; char line[160]; size_t n = 0;
     for (const char *c = body;; c++) {
       if (*c == '\n' || *c == 0) {
         line[n] = 0;

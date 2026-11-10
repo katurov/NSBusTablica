@@ -112,6 +112,8 @@ curl -sS 'http://gspns.rs/red-voznje/ispis-polazaka?rv=rvg&vaziod=2026-10-01&dan
 4. Server side: `tail nstupido.log` (`client 192.168.42.91 first request: /frame?stop=6539 -> 200`, `http: /frame 200 x360` every 30 min); `GET /` shows queue, backoff, watch list, `http` counts and the last request per client.
 5. Legacy USB bridge: `python3 oled_bridge.py --stop 6539` (requires `pyserial`); don't open the serial monitor at the same time.
 6. Brightness: `OLED_CONTRAST` in `firmware/platformio.ini` (currently 40 out of 255).
+7. T-Display (v4.4, env `tdisplay`, port `/dev/cu.usbserial-…`): the log shows `[nstupido] stop 6539 "Bulevar kralja Petra prvog-Mašinska škola" routes N page 1/P` after each `-> 200`. Empty quotes = the server is older than v4.4 (no `N` line; the board then shows the number only) → `git pull` + restart the server. `curl -s ".../frame?stop=6539"` must contain `N|Bulevar kralja Petra prvog-Mašinska škola`.
+8. T-Display without pressing buttons: send `stop`, `page` or `shot` over the serial port (115200). `shot` answers `SHOT 240 135` + 64 800 bytes RGB565 big-endian = what is on the screen; convert with PIL to check the layout (opening the port resets the board).
 
 ## 7. New Stop / Route Derivation (v4.1)
 
