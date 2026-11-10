@@ -3,7 +3,7 @@
 // parsed by include/frame.h. Built with Grok Bot.
 //
 // Layout (240x135):
-//   top 34 px  light blue header: stop number (black on a darker blue box; "*" warming, "!" nsmart offline;
+//   top 34 px  light blue band (32 px, then 2 px black gap before the routes): stop number (black on a darker blue box; "*" warming, "!" nsmart offline;
 //              inverted while switching stops), then the stop name (N line, server v4.4+) in one line, Roboto
 //              Condensed SemiBold 24 px anti-aliased (TFT_eSPI smooth font, include/hdr_font.h made by
 //              tools/make_vlw.py, has č ć š ž đ). A name wider than the space scrolls (marquee: 2 s pause, then
@@ -62,7 +62,8 @@
 
 #define W 240
 #define H 135
-#define HDR 34
+#define HDR 34                    // header area; route rows start below it
+#define BAND (HDR - 2)            // blue band height: 2 px of black gap above the first route row
 
 TFT_eSPI tft;
 TFT_eSprite spr(&tft);
@@ -152,8 +153,8 @@ static void smoothAt(TFT_eSPI &g, int x, int y, const char *str) { g.setCursor(x
 static void drawHeader() {
   TFT_eSPI &g = gfx();
   bool switching = btnFeedbackSince != 0;
-  g.fillRect(0, 0, W, HDR, C_BLUE);
-  const int top = (HDR - (g.gFont.maxAscent + g.gFont.maxDescent)) / 2;
+  g.fillRect(0, 0, W, BAND, C_BLUE);
+  const int top = (BAND - (g.gFont.maxAscent + g.gFont.maxDescent)) / 2;
   g.setTextWrap(false, false);
   // stop number: black on a darker blue box; inverted while switching stops (until the new frame arrives)
   char uid[12];
@@ -161,7 +162,7 @@ static void drawHeader() {
   snprintf(uid, sizeof uid, "%s%s", stops[stopIdx], mark);
   int ub = g.textWidth(uid) + 12;
   uint16_t boxBg = switching ? TFT_BLACK : C_BLUE2, boxFg = switching ? C_BLUE : TFT_BLACK;
-  g.fillRect(0, 0, ub, HDR, boxBg);
+  g.fillRect(0, 0, ub, BAND, boxBg);
   g.setTextColor(boxFg, boxBg);
   smoothAt(g, 6, top, uid);
   // stop name
@@ -175,7 +176,7 @@ static void drawHeader() {
   if (!nameTW) return;
   g.setTextColor(TFT_BLACK, C_BLUE);
   if (nameTW <= nameW) { smoothAt(g, nameX, top, name); nameOff = 0; return; }
-  g.setViewport(nameX, 0, nameW, HDR);             // clip; coordinates relative to the viewport
+  g.setViewport(nameX, 0, nameW, BAND);             // clip; coordinates relative to the viewport
   smoothAt(g, -nameOff, top, name);
   if (nameTW + MARQUEE_GAP - nameOff < nameW) smoothAt(g, nameTW + MARQUEE_GAP - nameOff, top, name);
   g.resetViewport();

@@ -232,7 +232,7 @@ pio device monitor                     # optional: "[nstupido] GET … -> 200" l
 
 LilyGO TTGO T-Display: ESP32-D0WDQ6 (4 MB flash, no PSRAM), 1.14″ ST7789V IPS 135×240 used landscape (240×135), CP2104 USB-UART, buttons GPIO0 and GPIO35. Same server, same `/frame`, same stops, same error texts and retry rules as the OLED board. Built with Grok Bot.
 
-![T-Display, real framebuffer screenshots: 6539 (name scrolling) and 15889 (page 1 of 2)](docs/img/tdisplay.png)
+![T-Display, real framebuffer screenshots: stop 6539 at two moments of the scrolling name](docs/img/tdisplay.png)
 
 ```bash
 cd firmware                                   # secrets.ini as for the OLED board
@@ -241,7 +241,7 @@ pio device monitor -e tdisplay                # "[nstupido] stop 6539 \"Bulevar 
 ```
 
 Layout (Paul's spec):
-- **Header**, top quarter (34 px), light blue: the **stop number** in black on a darker blue box (`*` warming, `!` nsmart offline; the box inverts while switching stops), then the **stop name** on one line in Roboto Condensed SemiBold 24 px, anti-aliased, black. A name that does not fit **scrolls** (marquee: 2 s pause at the start, then ~33 px/s, wraps with a gap); short names stay still. No `N` line from the server (older than v4.4) → the number alone.
+- **Header**, top quarter (34 px): a 32 px light blue band plus a 2 px black gap above the routes (Paul: more space between the band and the route numbers); in the band the **stop number** in black on a darker blue box (`*` warming, `!` nsmart offline; the box inverts while switching stops), then the **stop name** on one line in Roboto Condensed SemiBold 24 px, anti-aliased, black. A name that does not fit **scrolls** (marquee: 2 s pause at the start, then ~33 px/s, wraps with a gap); short names stay still. No `N` line from the server (older than v4.4) → the number alone.
 - **Routes**, one per row, 4 rows (`-DTD_ROWS=5` → 5 smaller rows): route number **bold** white, right-aligned in a fixed 5-character column; then up to two waits `<n> min`, coloured by source: **G** live = green, **P** timetable = orange, **E** estimate = yellow.
 - **Pages**: more routes than rows → dots at the right edge (current page white). Pages turn only by button; 30 s after the last page press the board goes back to page 1 (the nearest buses).
 - **Buttons**: left / GPIO0 = next stop (page 1); right / GPIO35 = next page. Same 30 ms debounce as the OLED board (the earlier phantom presses came from a changed debounce).
